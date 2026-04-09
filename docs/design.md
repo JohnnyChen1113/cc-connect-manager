@@ -1,0 +1,1 @@
+/Users/johnny/cc-connect-manager/docs/superpowers/specs/2026-04-08-manage-py-redesign.md
