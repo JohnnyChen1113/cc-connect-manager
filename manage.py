@@ -797,6 +797,71 @@ def do_delete() -> None:
         print("  已取消。")
 
 
+def do_reuse() -> None:
+    """Reuse an existing project (Feishu bot) for a different task.
+
+    Changes project name and work_dir, restarts daemon.
+    Old session files and Claude Code memory are preserved.
+    """
+    header("复用项目")
+
+    doc = load_config()
+    projects = get_projects(doc)
+    show_dashboard()
+
+    idx = pick_project(projects, "复用")
+    if idx is None:
+        return
+
+    proj = projects[idx]
+    old_name = proj.get("name", "")
+    old_dir = proj.get("agent", {}).get("options", {}).get("work_dir", "")
+
+    print(f"\n  {DIM}将复用此项目的平台凭证，切换到新的工作内容{RESET}")
+    print(f"  {DIM}旧项目的 session 和记忆文件将保留{RESET}\n")
+
+    # 1. New name
+    existing_names = {p.get("name", "") for p in projects}
+    while True:
+        new_name = ask("新项目名称")
+        if not new_name:
+            err("名称不能为空。")
+            continue
+        if new_name in existing_names:
+            err(f"'{new_name}' 已存在。")
+            continue
+        break
+
+    # 2. New work dir
+    new_dir = ask("新工作目录")
+    if not new_dir:
+        err("工作目录不能为空。")
+        return
+    new_dir = os.path.expanduser(new_dir)
+    if not os.path.isdir(new_dir):
+        warn(f"目录 '{new_dir}' 不存在（可稍后创建）")
+
+    # 3. Confirm
+    print(f"\n  {BOLD}变更预览:{RESET}")
+    print(f"    名称:     {old_name} → {new_name}")
+    print(f"    工作目录: {old_dir} → {new_dir}")
+    print(f"    平台凭证: 保持不变")
+    print()
+    if not ask_confirm("确认复用？"):
+        print("  已取消。")
+        return
+
+    # 4. Update config
+    proj["name"] = new_name
+    proj["agent"]["options"]["work_dir"] = new_dir
+
+    save_config(doc)
+    info(f"项目已从 '{old_name}' 切换到 '{new_name}'")
+
+    # 5. Restart
+    prompt_restart()
+
+
 # ── Main ──────────────────────────────────────────────────────────────
 
 
@@ -829,7 +894,7 @@ def main() -> None:
             case "d":
                 do_delete()
             case "w":
-                warn("复用功能尚未实现")
+                do_reuse()
             case "r":
                 restart_cc()
             case "q":
