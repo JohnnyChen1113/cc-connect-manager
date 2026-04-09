@@ -862,6 +862,17 @@ def do_reuse() -> None:
     prompt_restart()
 
 
+def do_restart() -> None:
+    """Restart cc-connect daemon."""
+    header("重启服务")
+    running, pid = is_cc_running()
+    if running:
+        print(f"  当前 PID: {pid}")
+    else:
+        warn("cc-connect 未运行")
+    restart_cc()
+
+
 # ── Main ──────────────────────────────────────────────────────────────
 
 
@@ -896,7 +907,7 @@ def main() -> None:
             case "w":
                 do_reuse()
             case "r":
-                restart_cc()
+                do_restart()
             case "q":
                 print("  再见!")
                 break
