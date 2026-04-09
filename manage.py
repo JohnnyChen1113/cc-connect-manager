@@ -624,6 +624,179 @@ def pick_project(projects: list, action: str) -> int | None:
     return idx
 
 
+# ── TOML project builder ──────────────────────────────────────────────
+
+
+def build_project_table(
+    name: str,
+    work_dir: str,
+    platform_type: str,
+    platform_opts: dict,
+    mode: str = "code",
+    model: str = "",
+) -> tomlkit.items.Table:
+    """Build a [[projects]] TOML table."""
+    t = tomlkit.table()
+    t["name"] = name
+
+    agent = tomlkit.table()
+    agent["type"] = "claudecode"
+    agent_opts = tomlkit.table()
+    agent_opts["work_dir"] = work_dir
+    agent_opts["mode"] = mode
+    if model:
+        agent_opts["model"] = model
+    agent["options"] = agent_opts
+    t["agent"] = agent
+
+    plat = tomlkit.table()
+    plat["type"] = platform_type
+    plat_opts_table = tomlkit.table()
+    for k, v in platform_opts.items():
+        plat_opts_table[k] = v
+    plat["options"] = plat_opts_table
+
+    plat_aot = tomlkit.aot()
+    plat_aot.append(plat)
+    t["platforms"] = plat_aot
+
+    return t
+
+
+# ── Interactive flows ─────────────────────────────────────────────────
+
+
+def do_add() -> None:
+    """Add a new project."""
+    header("添加项目")
+
+    doc = load_config()
+    projects = get_projects(doc)
+    existing_names = {p.get("name", "") for p in projects}
+
+    # 1. Name
+    print(f"  {DIM}给项目起个名字，用于区分不同机器人{RESET}")
+    while True:
+        name = ask("项目名称")
+        if not name:
+            err("名称不能为空。")
+            continue
+        if name in existing_names:
+            err(f"'{name}' 已存在。")
+            continue
+        break
+
+    # 2. Work dir
+    print(f"\n  {DIM}Claude 会在这个目录下读写文件{RESET}")
+    work_dir = ask("工作目录", os.getcwd())
+    work_dir = os.path.expanduser(work_dir)
+    if not os.path.isdir(work_dir):
+        warn(f"目录 '{work_dir}' 不存在")
+
+    # 3. Platform
+    platform = choose_platform()
+    if not platform:
+        return
+
+    # 4. Credentials
+    creds = collect_platform_creds(platform)
+    if not creds:
+        return
+
+    # 5. Build & save
+    proj_table = build_project_table(name, work_dir, platform, creds)
+    if "projects" not in doc:
+        doc["projects"] = tomlkit.aot()
+    doc["projects"].append(proj_table)
+    save_config(doc)
+    info(f"项目 '{name}' 已添加")
+
+    # 6. Restart
+    prompt_restart()
+
+    # 7. Platform guide
+    if platform == "feishu":
+        show_feishu_guide(creds.get("app_id", ""))
+
+
+def do_edit() -> None:
+    """Edit an existing project."""
+    header("编辑项目")
+
+    doc = load_config()
+    projects = get_projects(doc)
+    show_dashboard()
+
+    idx = pick_project(projects, "编辑")
+    if idx is None:
+        return
+
+    proj = projects[idx]
+    old_name = proj.get("name", "")
+    print(f"\n  {DIM}回车保留当前值{RESET}")
+
+    # Editable fields
+    new_name = ask("项目名称", old_name)
+    existing_names = {p.get("name", "") for p in projects}
+    if new_name != old_name and new_name in existing_names:
+        err(f"'{new_name}' 已存在。")
+        return
+
+    agent_opts = proj.get("agent", {}).get("options", {})
+    new_dir = os.path.expanduser(
+        ask("工作目录", agent_opts.get("work_dir", ""))
+    )
+    new_mode = ask(
+        "模式 (code/plan/ask)",
+        agent_opts.get("mode", "code"),
+    )
+
+    # Update fields
+    proj["name"] = new_name
+    agent_opts["work_dir"] = new_dir
+    agent_opts["mode"] = new_mode
+
+    # Platform credentials
+    plats = proj.get("platforms", [])
+    if plats:
+        plat = plats[0]
+        plat_type = plat.get("type", "feishu")
+        if ask_confirm(f"更新 {plat_type} 凭证？", default_yes=False):
+            existing_opts = dict(plat.get("options", {}))
+            new_opts = collect_platform_creds(plat_type, existing_opts)
+            if new_opts:
+                opts_table = tomlkit.table()
+                for k, v in new_opts.items():
+                    opts_table[k] = v
+                plat["options"] = opts_table
+
+    save_config(doc)
+    info(f"项目 '{new_name}' 已更新")
+    prompt_restart()
+
+
+def do_delete() -> None:
+    """Delete a project."""
+    header("删除项目")
+
+    doc = load_config()
+    projects = get_projects(doc)
+    show_dashboard()
+
+    idx = pick_project(projects, "删除")
+    if idx is None:
+        return
+
+    name = projects[idx].get("name", "?")
+    if ask_confirm(f"确认删除 '{name}'？", default_yes=False):
+        del doc["projects"][idx]
+        save_config(doc)
+        info(f"项目 '{name}' 已删除")
+        prompt_restart()
+    else:
+        print("  已取消。")
+
+
 # ── Main ──────────────────────────────────────────────────────────────
 
 
@@ -650,11 +823,11 @@ def main() -> None:
 
         match choice:
             case "a":
-                warn("添加功能尚未实现")
+                do_add()
             case "e":
-                warn("编辑功能尚未实现")
+                do_edit()
             case "d":
-                warn("删除功能尚未实现")
+                do_delete()
             case "w":
                 warn("复用功能尚未实现")
             case "r":
