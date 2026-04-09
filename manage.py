@@ -9,8 +9,12 @@
 import getpass
 import json
 import os
+import platform
+import shutil
+import signal
 import subprocess
 import sys
+import time
 from pathlib import Path
 
 try:
@@ -24,6 +28,7 @@ except ImportError:
 CC_DIR = Path.home() / ".cc-connect"
 CONFIG_FILE = CC_DIR / "config.toml"
 SESSIONS_DIR = CC_DIR / "sessions"
+LAUNCHD_PLIST = Path.home() / "Library/LaunchAgents/com.cc-connect.service.plist"
 
 # ── Colors ────────────────────────────────────────────────────────────
 
@@ -207,8 +212,6 @@ def restart_cc() -> bool:
             pass
 
     if pid:
-        import signal
-        import time
         try:
             os.kill(pid, signal.SIGTERM)
             time.sleep(2)
@@ -246,25 +249,31 @@ def prompt_restart() -> None:
 
 # ── Platform credentials ──────────────────────────────────────────────
 
-PLATFORMS = {
-    "feishu":   "飞书 / Lark",
-    "telegram": "Telegram",
-    "discord":  "Discord",
-    "dingtalk": "钉钉",
-    "slack":    "Slack",
-    "wechat":   "个人微信",
-    "qq":       "QQ",
-    "qqbot":    "QQ Bot（官方机器人）",
-    "wecom":    "企业微信",
-    "line":     "LINE",
-}
+# Each entry: (display_key, label, config_type, default_domain_override)
+# config_type is what goes into config.toml [[projects.platforms]] type
+# default_domain_override is set automatically (None = use platform default)
+PLATFORM_CHOICES = [
+    ("feishu",   "飞书",                    "feishu", None),
+    ("lark",     "Lark (International)",   "feishu", "https://open.larksuite.com"),
+    ("telegram", "Telegram",               "telegram", None),
+    ("discord",  "Discord",                "discord", None),
+    ("dingtalk", "钉钉",                    "dingtalk", None),
+    ("slack",    "Slack",                   "slack", None),
+    ("wechat",   "个人微信",                "wechat", None),
+    ("qq",       "QQ",                      "qq", None),
+    ("qqbot",    "QQ Bot（官方机器人）",     "qqbot", None),
+    ("wecom",    "企业微信",                "wecom", None),
+    ("line",     "LINE",                    "line", None),
+]
+
+# Legacy lookup for display (used by dashboard)
+PLATFORMS = {key: label for key, label, _, _ in PLATFORM_CHOICES}
 
 
-def choose_platform() -> str | None:
-    """Let user pick a platform from the list."""
+def choose_platform() -> tuple[str, str | None] | None:
+    """Let user pick a platform. Returns (config_type, domain_override) or None."""
     print(f"\n  {CYAN}── 选择平台 ──{RESET}")
-    items = list(PLATFORMS.items())
-    for i, (key, label) in enumerate(items, 1):
+    for i, (key, label, _, _) in enumerate(PLATFORM_CHOICES, 1):
         print(f"  {i:>2}) {label} ({key})")
     choice = ask("选择平台编号")
     try:
@@ -272,22 +281,30 @@ def choose_platform() -> str | None:
     except ValueError:
         err("请输入数字。")
         return None
-    if idx < 0 or idx >= len(items):
+    if idx < 0 or idx >= len(PLATFORM_CHOICES):
         err("无效编号。")
         return None
-    return items[idx][0]
+    _, _, config_type, domain_override = PLATFORM_CHOICES[idx]
+    return config_type, domain_override
 
 
-def collect_feishu(existing: dict | None = None) -> dict | None:
-    """Collect Feishu credentials interactively."""
-    print(f"\n  {CYAN}── 飞书应用凭证 ──{RESET}")
+def collect_feishu(existing: dict | None = None, domain_override: str | None = None) -> dict | None:
+    """Collect Feishu/Lark credentials interactively.
+
+    domain_override: if set (e.g. for Lark), used as the default domain.
+    """
+    is_lark = domain_override == "https://open.larksuite.com"
+    platform_label = "Lark" if is_lark else "飞书"
+    console_hint = "Lark Developer Console" if is_lark else "飞书开放平台 → 凭证与基础信息"
+
+    print(f"\n  {CYAN}── {platform_label} 应用凭证 ──{RESET}")
     if existing:
         print(f"  {DIM}回车保留当前值{RESET}")
 
     default_id = existing.get("app_id", "") if existing else ""
     default_secret = existing.get("app_secret", "") if existing else ""
 
-    print(f"  {DIM}在飞书开放平台 → 凭证与基础信息中获取{RESET}")
+    print(f"  {DIM}在{console_hint}中获取{RESET}")
     app_id = ask("App ID", default_id)
     if app_id and not app_id.startswith("cli_"):
         warn("App ID 通常以 cli_ 开头，请确认")
@@ -307,7 +324,14 @@ def collect_feishu(existing: dict | None = None) -> dict | None:
 
     opts = {"app_id": app_id, "app_secret": app_secret}
 
-    domain = ask("Domain", existing.get("domain", "https://open.feishu.cn") if existing else "https://open.feishu.cn")
+    # Determine default domain
+    default_domain = "https://open.feishu.cn"
+    if domain_override:
+        default_domain = domain_override
+    elif existing and existing.get("domain"):
+        default_domain = existing["domain"]
+
+    domain = ask("Domain", default_domain)
     if domain != "https://open.feishu.cn":
         opts["domain"] = domain
 
@@ -565,17 +589,32 @@ PLATFORM_COLLECTORS = {
 }
 
 
-def collect_platform_creds(platform: str, existing: dict | None = None) -> dict | None:
+def collect_platform_creds(
+    platform: str,
+    existing: dict | None = None,
+    domain_override: str | None = None,
+) -> dict | None:
     """Dispatch to the right credential collector."""
     collector = PLATFORM_COLLECTORS.get(platform, collect_generic)
+    if platform == "feishu":
+        return collector(existing, domain_override=domain_override)
     return collector(existing)
 
 
-def show_feishu_guide(app_id: str) -> None:
-    """Post-setup guide for Feishu app configuration."""
-    url = f"https://open.feishu.cn/app/{app_id}" if app_id else "https://open.feishu.cn/app"
+def show_feishu_guide(app_id: str, is_lark: bool = False) -> None:
+    """Post-setup guide for Feishu/Lark app configuration."""
+    if is_lark:
+        base = "https://open.larksuite.com"
+        title = "Lark App Configuration Checklist"
+        search_hint = "Search for the bot name in Lark, start a chat or add to a group"
+    else:
+        base = "https://open.feishu.cn"
+        title = "飞书应用配置清单"
+        search_hint = "在飞书中搜索机器人名称，发起单聊或拉入群聊"
 
-    header("飞书应用配置清单")
+    url = f"{base}/app/{app_id}" if app_id else f"{base}/app"
+
+    header(title)
     print(f"  控制台: {CYAN}{url}{RESET}\n")
 
     print(f"  {BOLD}1. 启用机器人能力{RESET}")
@@ -607,7 +646,7 @@ def show_feishu_guide(app_id: str) -> None:
     print(f"     版本管理 → 创建版本 → 提交审核 → 管理员审批\n")
 
     print(f"  {BOLD}5. 开始使用{RESET}")
-    print(f"     在飞书中搜索机器人名称，发起单聊或拉入群聊\n")
+    print(f"     {search_hint}\n")
 
 
 # ── Dashboard ─────────────────────────────────────────────────────────
@@ -634,11 +673,20 @@ def show_dashboard() -> None:
     for i, proj in enumerate(projects, 1):
         name = proj.get("name", "?")
         plats = proj.get("platforms", [])
-        platform = plats[0].get("type", "-") if plats else "-"
+        if plats:
+            plat_type = plats[0].get("type", "-")
+            plat_domain = plats[0].get("options", {}).get("domain", "")
+            # Show "lark" for feishu projects using larksuite domain
+            if plat_type == "feishu" and "larksuite" in plat_domain:
+                plat_display = "lark"
+            else:
+                plat_display = plat_type
+        else:
+            plat_display = "-"
         work_dir = proj.get("agent", {}).get("options", {}).get("work_dir", "-")
         session_id = get_session_id(name) or "—"
         print(
-            f"  {i:<4}{name:<21}{platform:<9}"
+            f"  {i:<4}{name:<21}{plat_display:<9}"
             f"{work_dir:<40}{session_id}"
         )
     print()
@@ -731,17 +779,18 @@ def do_add() -> None:
         warn(f"目录 '{work_dir}' 不存在")
 
     # 3. Platform
-    platform = choose_platform()
-    if not platform:
+    result = choose_platform()
+    if not result:
         return
+    platform_type, domain_override = result
 
     # 4. Credentials
-    creds = collect_platform_creds(platform)
+    creds = collect_platform_creds(platform_type, domain_override=domain_override)
     if not creds:
         return
 
     # 5. Build & save
-    proj_table = build_project_table(name, work_dir, platform, creds)
+    proj_table = build_project_table(name, work_dir, platform_type, creds)
     if "projects" not in doc:
         doc["projects"] = tomlkit.aot()
     doc["projects"].append(proj_table)
@@ -752,8 +801,9 @@ def do_add() -> None:
     prompt_restart()
 
     # 7. Platform guide
-    if platform == "feishu":
-        show_feishu_guide(creds.get("app_id", ""))
+    if platform_type == "feishu":
+        is_lark = domain_override == "https://open.larksuite.com"
+        show_feishu_guide(creds.get("app_id", ""), is_lark=is_lark)
 
 
 def do_edit() -> None:
@@ -899,6 +949,198 @@ def do_reuse() -> None:
     prompt_restart()
 
 
+# ── Install wizard ────────────────────────────────────────────────────
+
+
+def _find_cc_connect() -> str | None:
+    """Return the path to cc-connect binary, or None."""
+    return shutil.which("cc-connect")
+
+
+def _find_npm() -> str | None:
+    """Return the path to npm, or None."""
+    return shutil.which("npm")
+
+
+def _get_cc_version() -> str | None:
+    """Get installed cc-connect version string."""
+    try:
+        result = subprocess.run(
+            ["cc-connect", "--version"],
+            capture_output=True, text=True, timeout=5,
+        )
+        if result.returncode == 0:
+            return result.stdout.strip()
+    except (FileNotFoundError, subprocess.TimeoutExpired):
+        pass
+    return None
+
+
+def _generate_plist(cc_path: str) -> str:
+    """Generate launchd plist content for cc-connect."""
+    # Build PATH from current environment
+    env_path = os.environ.get("PATH", "/usr/bin:/bin:/usr/sbin:/sbin")
+    return f"""<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+\t<key>Label</key>
+\t<string>com.cc-connect.service</string>
+\t<key>ProgramArguments</key>
+\t<array>
+\t\t<string>{cc_path}</string>
+\t</array>
+\t<key>WorkingDirectory</key>
+\t<string>{CC_DIR}</string>
+\t<key>RunAtLoad</key>
+\t<true/>
+\t<key>KeepAlive</key>
+\t<true/>
+\t<key>EnvironmentVariables</key>
+\t<dict>
+\t\t<key>CC_LOG_FILE</key>
+\t\t<string>{CC_DIR / 'logs' / 'cc-connect.log'}</string>
+\t\t<key>CC_LOG_MAX_SIZE</key>
+\t\t<string>10485760</string>
+\t\t<key>PATH</key>
+\t\t<string>{env_path}</string>
+\t</dict>
+\t<key>StandardOutPath</key>
+\t<string>/dev/null</string>
+\t<key>StandardErrorPath</key>
+\t<string>/dev/null</string>
+</dict>
+</plist>"""
+
+
+def _setup_launchd(cc_path: str) -> bool:
+    """Set up launchd plist to auto-start cc-connect on macOS."""
+    if platform.system() != "Darwin":
+        warn("自动启动仅支持 macOS launchd")
+        print(f"  {DIM}请手动配置 systemd 或其他服务管理器{RESET}")
+        return False
+
+    plist_dir = LAUNCHD_PLIST.parent
+    plist_dir.mkdir(parents=True, exist_ok=True)
+
+    if LAUNCHD_PLIST.exists():
+        if not ask_confirm("launchd 配置已存在，覆盖？", default_yes=False):
+            info("保留现有 launchd 配置")
+            return True
+
+    plist_content = _generate_plist(cc_path)
+    LAUNCHD_PLIST.write_text(plist_content)
+    info(f"launchd 配置已写入: {LAUNCHD_PLIST}")
+
+    # Bootstrap the service
+    uid = os.getuid()
+    try:
+        subprocess.run(
+            ["launchctl", "bootstrap", f"gui/{uid}", str(LAUNCHD_PLIST)],
+            capture_output=True, text=True, check=True,
+        )
+        info("cc-connect 已注册为开机自启动服务")
+    except subprocess.CalledProcessError:
+        # May already be bootstrapped
+        warn("launchctl bootstrap 失败（可能已注册），尝试启动...")
+
+    # Start/restart the service
+    time.sleep(1)
+    running, pid = is_cc_running()
+    if running:
+        info(f"cc-connect 已启动 (PID {pid})")
+        return True
+    else:
+        warn("服务已注册但未检测到运行中的进程")
+        print(f"  {DIM}手动启动: launchctl kickstart gui/{uid}/com.cc-connect.service{RESET}")
+        return False
+
+
+def do_install() -> None:
+    """Interactive installation wizard for cc-connect."""
+    header("安装 / 更新 cc-connect")
+
+    # Step 1: Check current state
+    cc_path = _find_cc_connect()
+    if cc_path:
+        version = _get_cc_version() or "未知版本"
+        info(f"cc-connect 已安装: {cc_path}")
+        print(f"  {DIM}版本: {version}{RESET}")
+        print()
+        if not ask_confirm("检查更新？"):
+            return
+    else:
+        print(f"  {DIM}cc-connect 尚未安装，将引导你完成安装{RESET}\n")
+
+    # Step 2: Check npm
+    npm_path = _find_npm()
+    if not npm_path:
+        err("未找到 npm")
+        print(f"  {DIM}请先安装 Node.js: https://nodejs.org/{RESET}")
+        print(f"  {DIM}或使用 Homebrew: brew install node{RESET}")
+        return
+
+    node_result = subprocess.run(
+        ["node", "--version"], capture_output=True, text=True,
+    )
+    npm_result = subprocess.run(
+        [npm_path, "--version"], capture_output=True, text=True,
+    )
+    info(f"Node.js {node_result.stdout.strip()}, npm {npm_result.stdout.strip()}")
+
+    # Step 3: Install/update via npm
+    action = "更新" if cc_path else "安装"
+    print(f"\n  {DIM}将执行: npm install -g cc-connect{RESET}")
+    if not ask_confirm(f"确认{action}？"):
+        print("  已取消。")
+        return
+
+    print(f"\n  {DIM}正在{action} cc-connect...{RESET}\n")
+    install_result = subprocess.run(
+        [npm_path, "install", "-g", "cc-connect"],
+        text=True,
+    )
+
+    if install_result.returncode != 0:
+        err(f"{action}失败")
+        print(f"  {DIM}如果权限不足，尝试: sudo npm install -g cc-connect{RESET}")
+        return
+
+    # Verify installation
+    cc_path = _find_cc_connect()
+    if not cc_path:
+        err("安装后仍找不到 cc-connect，请检查 PATH")
+        return
+
+    version = _get_cc_version() or "未知版本"
+    info(f"cc-connect {action}成功: {version}")
+
+    # Step 4: Create config directory
+    CC_DIR.mkdir(parents=True, exist_ok=True)
+    (CC_DIR / "logs").mkdir(exist_ok=True)
+    (CC_DIR / "sessions").mkdir(exist_ok=True)
+
+    # Initialize config.toml if needed
+    if not CONFIG_FILE.exists():
+        doc = load_config()
+        save_config(doc)
+        info("已创建默认配置: ~/.cc-connect/config.toml")
+    else:
+        info("配置文件已存在: ~/.cc-connect/config.toml")
+
+    # Step 5: Set up auto-start
+    print()
+    if ask_confirm("设置开机自动启动？"):
+        _setup_launchd(cc_path)
+    else:
+        warn("跳过自动启动配置")
+        print(f"  {DIM}手动启动: cc-connect --config ~/.cc-connect/config.toml{RESET}")
+
+    # Step 6: Done
+    print()
+    info("安装完成！接下来可以用 [a] 添加项目")
+
+
 def do_restart() -> None:
     """Restart cc-connect daemon."""
     header("重启服务")
@@ -924,6 +1166,7 @@ def main() -> None:
             f"{BOLD}[d]{RESET} 删除   "
             f"{BOLD}[w]{RESET} 复用项目   "
             f"{BOLD}[r]{RESET} 重启   "
+            f"{BOLD}[i]{RESET} 安装/更新   "
             f"{BOLD}[q]{RESET} 退出"
         )
         print()
@@ -945,6 +1188,8 @@ def main() -> None:
                 do_reuse()
             case "r":
                 do_restart()
+            case "i":
+                do_install()
             case "q":
                 print("  再见!")
                 break
