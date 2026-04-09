@@ -207,5 +207,98 @@ def prompt_restart() -> None:
         print(f"  {DIM}启动: cc-connect --config ~/.cc-connect/config.toml{RESET}")
 
 
+# ── Dashboard ─────────────────────────────────────────────────────────
+
+
+def show_dashboard() -> None:
+    """Show service status + project list with session IDs."""
+    running, pid = is_cc_running()
+    status = f"{GREEN}运行中{RESET} (PID {pid})" if running else f"{RED}未运行{RESET}"
+    print(f"\n  服务状态: {status}")
+
+    doc = load_config()
+    projects = get_projects(doc)
+    if not projects:
+        print(f"  {DIM}暂无项目{RESET}\n")
+        return
+
+    print()
+    print(
+        f"  {BOLD}{'#':<4}{'名称':<21}{'平台':<9}"
+        f"{'工作目录':<40}{'Session ID'}{RESET}"
+    )
+    print(f"  {DIM}{'─' * 110}{RESET}")
+    for i, proj in enumerate(projects, 1):
+        name = proj.get("name", "?")
+        plats = proj.get("platforms", [])
+        platform = plats[0].get("type", "-") if plats else "-"
+        work_dir = proj.get("agent", {}).get("options", {}).get("work_dir", "-")
+        session_id = get_session_id(name) or "—"
+        print(
+            f"  {i:<4}{name:<21}{platform:<9}"
+            f"{work_dir:<40}{session_id}"
+        )
+    print()
+
+
+def pick_project(projects: list, action: str) -> int | None:
+    """Let user pick a project by number. Returns index or None."""
+    if not projects:
+        warn("暂无项目。")
+        return None
+    choice = ask(f"选择要{action}的项目编号")
+    try:
+        idx = int(choice) - 1
+    except ValueError:
+        err("请输入数字。")
+        return None
+    if idx < 0 or idx >= len(projects):
+        err("无效编号。")
+        return None
+    return idx
+
+
+# ── Main ──────────────────────────────────────────────────────────────
+
+
+def main() -> None:
+    while True:
+        header("cc-connect 配置管理")
+        show_dashboard()
+
+        print(
+            f"  {BOLD}[a]{RESET} 添加   "
+            f"{BOLD}[e]{RESET} 编辑   "
+            f"{BOLD}[d]{RESET} 删除   "
+            f"{BOLD}[w]{RESET} 复用项目   "
+            f"{BOLD}[r]{RESET} 重启   "
+            f"{BOLD}[q]{RESET} 退出"
+        )
+        print()
+
+        try:
+            choice = input(f"  {BOLD}>{RESET} ").strip().lower()
+        except (EOFError, KeyboardInterrupt):
+            print("\n  再见!")
+            break
+
+        match choice:
+            case "a":
+                warn("添加功能尚未实现")
+            case "e":
+                warn("编辑功能尚未实现")
+            case "d":
+                warn("删除功能尚未实现")
+            case "w":
+                warn("复用功能尚未实现")
+            case "r":
+                restart_cc()
+            case "q":
+                print("  再见!")
+                break
+            case _:
+                err("无效选择。")
+
+
 if __name__ == "__main__":
-    pass
+    main()
