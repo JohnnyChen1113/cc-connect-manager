@@ -207,6 +207,372 @@ def prompt_restart() -> None:
         print(f"  {DIM}启动: cc-connect --config ~/.cc-connect/config.toml{RESET}")
 
 
+# ── Platform credentials ──────────────────────────────────────────────
+
+PLATFORMS = {
+    "feishu":   "飞书 / Lark",
+    "telegram": "Telegram",
+    "discord":  "Discord",
+    "dingtalk": "钉钉",
+    "slack":    "Slack",
+    "wechat":   "个人微信",
+    "qq":       "QQ",
+    "qqbot":    "QQ Bot（官方机器人）",
+    "wecom":    "企业微信",
+    "line":     "LINE",
+}
+
+
+def choose_platform() -> str | None:
+    """Let user pick a platform from the list."""
+    print(f"\n  {CYAN}── 选择平台 ──{RESET}")
+    items = list(PLATFORMS.items())
+    for i, (key, label) in enumerate(items, 1):
+        print(f"  {i:>2}) {label} ({key})")
+    choice = ask("选择平台编号")
+    try:
+        idx = int(choice) - 1
+    except ValueError:
+        err("请输入数字。")
+        return None
+    if idx < 0 or idx >= len(items):
+        err("无效编号。")
+        return None
+    return items[idx][0]
+
+
+def collect_feishu(existing: dict | None = None) -> dict | None:
+    """Collect Feishu credentials interactively."""
+    print(f"\n  {CYAN}── 飞书应用凭证 ──{RESET}")
+    if existing:
+        print(f"  {DIM}回车保留当前值{RESET}")
+
+    default_id = existing.get("app_id", "") if existing else ""
+    default_secret = existing.get("app_secret", "") if existing else ""
+
+    print(f"  {DIM}在飞书开放平台 → 凭证与基础信息中获取{RESET}")
+    app_id = ask("App ID", default_id)
+    if app_id and not app_id.startswith("cli_"):
+        warn("App ID 通常以 cli_ 开头，请确认")
+
+    if existing and default_secret:
+        print(f"  {DIM}当前 App Secret: {mask(default_secret)}{RESET}")
+        if ask_confirm("保留当前 App Secret？"):
+            app_secret = default_secret
+        else:
+            app_secret = ask_secret("App Secret")
+    else:
+        app_secret = ask_secret("App Secret")
+
+    if not app_secret:
+        err("App Secret 不能为空")
+        return None
+
+    opts = {"app_id": app_id, "app_secret": app_secret}
+
+    domain = ask("Domain", existing.get("domain", "https://open.feishu.cn") if existing else "https://open.feishu.cn")
+    if domain != "https://open.feishu.cn":
+        opts["domain"] = domain
+
+    return opts
+
+
+def collect_telegram(existing: dict | None = None) -> dict | None:
+    """Collect Telegram credentials."""
+    print(f"\n  {CYAN}── Telegram Bot ──{RESET}")
+    if existing:
+        print(f"  {DIM}回车保留当前值{RESET}")
+
+    default_token = existing.get("bot_token", "") if existing else ""
+
+    print(f"  {DIM}从 @BotFather 获取 Bot Token{RESET}")
+    if existing and default_token:
+        print(f"  {DIM}当前 Token: {mask(default_token)}{RESET}")
+        if ask_confirm("保留当前 Token？"):
+            bot_token = default_token
+        else:
+            bot_token = ask_secret("Bot Token")
+    else:
+        bot_token = ask_secret("Bot Token")
+
+    if not bot_token:
+        err("Bot Token 不能为空")
+        return None
+
+    opts = {"bot_token": bot_token}
+    chat_id = ask("Chat ID（可选，限定群组）", existing.get("chat_id", "") if existing else "")
+    if chat_id:
+        opts["chat_id"] = chat_id
+    return opts
+
+
+def collect_discord(existing: dict | None = None) -> dict | None:
+    """Collect Discord credentials."""
+    print(f"\n  {CYAN}── Discord Bot ──{RESET}")
+    if existing:
+        print(f"  {DIM}回车保留当前值{RESET}")
+
+    default_token = existing.get("bot_token", "") if existing else ""
+
+    print(f"  {DIM}从 Discord Developer Portal 获取{RESET}")
+    if existing and default_token:
+        print(f"  {DIM}当前 Token: {mask(default_token)}{RESET}")
+        if ask_confirm("保留当前 Token？"):
+            bot_token = default_token
+        else:
+            bot_token = ask_secret("Bot Token")
+    else:
+        bot_token = ask_secret("Bot Token")
+
+    if not bot_token:
+        err("Bot Token 不能为空")
+        return None
+
+    opts = {"bot_token": bot_token}
+    guild_id = ask("Guild ID（可选，限定服务器）", existing.get("guild_id", "") if existing else "")
+    if guild_id:
+        opts["guild_id"] = guild_id
+    return opts
+
+
+def collect_dingtalk(existing: dict | None = None) -> dict | None:
+    """Collect DingTalk credentials."""
+    print(f"\n  {CYAN}── 钉钉应用凭证 ──{RESET}")
+    if existing:
+        print(f"  {DIM}回车保留当前值{RESET}")
+
+    default_key = existing.get("app_key", "") if existing else ""
+    default_secret = existing.get("app_secret", "") if existing else ""
+
+    print(f"  {DIM}在钉钉开放平台获取{RESET}")
+    app_key = ask("App Key", default_key)
+
+    if existing and default_secret:
+        print(f"  {DIM}当前 App Secret: {mask(default_secret)}{RESET}")
+        if ask_confirm("保留当前 App Secret？"):
+            app_secret = default_secret
+        else:
+            app_secret = ask_secret("App Secret")
+    else:
+        app_secret = ask_secret("App Secret")
+
+    if not app_secret:
+        err("App Secret 不能为空")
+        return None
+
+    return {"app_key": app_key, "app_secret": app_secret}
+
+
+def collect_slack(existing: dict | None = None) -> dict | None:
+    """Collect Slack credentials."""
+    print(f"\n  {CYAN}── Slack Bot ──{RESET}")
+    if existing:
+        print(f"  {DIM}回车保留当前值{RESET}")
+
+    default_token = existing.get("bot_token", "") if existing else ""
+    default_signing = existing.get("signing_secret", "") if existing else ""
+
+    print(f"  {DIM}从 Slack API Dashboard 获取{RESET}")
+    if existing and default_token:
+        print(f"  {DIM}当前 Bot Token: {mask(default_token)}{RESET}")
+        if ask_confirm("保留当前 Token？"):
+            bot_token = default_token
+        else:
+            bot_token = ask_secret("Bot Token (xoxb-...)")
+    else:
+        bot_token = ask_secret("Bot Token (xoxb-...)")
+
+    if not bot_token:
+        err("Bot Token 不能为空")
+        return None
+
+    if existing and default_signing:
+        print(f"  {DIM}当前 Signing Secret: {mask(default_signing)}{RESET}")
+        if ask_confirm("保留当前 Signing Secret？"):
+            signing_secret = default_signing
+        else:
+            signing_secret = ask_secret("Signing Secret")
+    else:
+        signing_secret = ask_secret("Signing Secret")
+
+    if not signing_secret:
+        err("Signing Secret 不能为空")
+        return None
+
+    return {"bot_token": bot_token, "signing_secret": signing_secret}
+
+
+def collect_generic(existing: dict | None = None) -> dict | None:
+    """Generic key=value collector for unsupported platforms."""
+    print(f"\n  {DIM}请输入该平台的配置项（格式: key=value，空行结束）{RESET}")
+    if existing:
+        print(f"  {DIM}当前配置:{RESET}")
+        for k, v in existing.items():
+            print(f"    {k}={v}")
+        print(f"  {DIM}重新输入全部配置（回车保留当前配置）:{RESET}")
+
+    opts = {}
+    while True:
+        line = ask("").strip()
+        if not line:
+            break
+        if "=" not in line:
+            warn("格式: key=value")
+            continue
+        key, _, val = line.partition("=")
+        opts[key.strip()] = val.strip()
+
+    if not opts and existing:
+        return dict(existing)
+    if not opts:
+        warn("未输入任何配置项")
+        return None
+    return opts
+
+
+def collect_wechat(existing: dict | None = None) -> dict | None:
+    """Collect WeChat credentials."""
+    print(f"\n  {CYAN}── 个人微信 ──{RESET}")
+    print(f"  {DIM}个人微信接入需配合 wechat-bridge 使用{RESET}")
+    print(f"  {DIM}详见: https://github.com/chenhg5/cc-connect{RESET}")
+    if existing:
+        print(f"  {DIM}回车保留当前值{RESET}")
+    return collect_generic(existing)
+
+
+def collect_qq(existing: dict | None = None) -> dict | None:
+    """Collect QQ credentials."""
+    print(f"\n  {CYAN}── QQ ──{RESET}")
+    if existing:
+        print(f"  {DIM}回车保留当前值{RESET}")
+
+    default_app_id = existing.get("app_id", "") if existing else ""
+
+    print(f"  {DIM}从 QQ 开放平台获取{RESET}")
+    app_id = ask("App ID", default_app_id)
+
+    default_token = existing.get("token", "") if existing else ""
+    if existing and default_token:
+        print(f"  {DIM}当前 Token: {mask(default_token)}{RESET}")
+        if ask_confirm("保留当前 Token？"):
+            token = default_token
+        else:
+            token = ask_secret("Token")
+    else:
+        token = ask_secret("Token")
+
+    default_secret = existing.get("app_secret", "") if existing else ""
+    if existing and default_secret:
+        print(f"  {DIM}当前 App Secret: {mask(default_secret)}{RESET}")
+        if ask_confirm("保留当前 App Secret？"):
+            app_secret = default_secret
+        else:
+            app_secret = ask_secret("App Secret")
+    else:
+        app_secret = ask_secret("App Secret")
+
+    if not token or not app_secret:
+        err("Token 和 App Secret 不能为空")
+        return None
+
+    return {"app_id": app_id, "token": token, "app_secret": app_secret}
+
+
+def collect_qqbot(existing: dict | None = None) -> dict | None:
+    """Collect QQ Bot credentials."""
+    print(f"\n  {CYAN}── QQ Bot（官方机器人）──{RESET}")
+    if existing:
+        print(f"  {DIM}回车保留当前值{RESET}")
+
+    default_app_id = existing.get("app_id", "") if existing else ""
+
+    print(f"  {DIM}从 QQ 机器人平台获取{RESET}")
+    app_id = ask("App ID", default_app_id)
+
+    default_token = existing.get("token", "") if existing else ""
+    if existing and default_token:
+        print(f"  {DIM}当前 Token: {mask(default_token)}{RESET}")
+        if ask_confirm("保留当前 Token？"):
+            token = default_token
+        else:
+            token = ask_secret("Token")
+    else:
+        token = ask_secret("Token")
+
+    default_secret = existing.get("app_secret", "") if existing else ""
+    if existing and default_secret:
+        print(f"  {DIM}当前 App Secret: {mask(default_secret)}{RESET}")
+        if ask_confirm("保留当前 App Secret？"):
+            app_secret = default_secret
+        else:
+            app_secret = ask_secret("App Secret")
+    else:
+        app_secret = ask_secret("App Secret")
+
+    if not token or not app_secret:
+        err("Token 和 App Secret 不能为空")
+        return None
+
+    return {"app_id": app_id, "token": token, "app_secret": app_secret}
+
+
+PLATFORM_COLLECTORS = {
+    "feishu": collect_feishu,
+    "telegram": collect_telegram,
+    "discord": collect_discord,
+    "dingtalk": collect_dingtalk,
+    "slack": collect_slack,
+    "wechat": collect_wechat,
+    "qq": collect_qq,
+    "qqbot": collect_qqbot,
+}
+
+
+def collect_platform_creds(platform: str, existing: dict | None = None) -> dict | None:
+    """Dispatch to the right credential collector."""
+    collector = PLATFORM_COLLECTORS.get(platform, collect_generic)
+    return collector(existing)
+
+
+def show_feishu_guide(app_id: str) -> None:
+    """Post-setup guide for Feishu app configuration."""
+    url = f"https://open.feishu.cn/app/{app_id}" if app_id else "https://open.feishu.cn/app"
+
+    header("飞书应用配置清单")
+    print(f"  控制台: {CYAN}{url}{RESET}\n")
+
+    print(f"  {BOLD}1. 启用机器人能力{RESET}")
+    print(f"     添加应用能力 → 机器人 → 填写名称和描述\n")
+
+    print(f"  {BOLD}2. 添加权限{RESET}")
+    print(f"     权限管理 → 批量开通 → 从其他应用导入 → 粘贴 JSON:")
+    print()
+    print(f'     {CYAN}{{"scopes": {{"tenant": [{RESET}')
+    scopes = [
+        "im:message:send_as_bot", "im:message:readonly",
+        "im:message.p2p_msg:readonly", "im:message.group_at_msg:readonly",
+        "im:message:update", "im:message.reactions:read",
+        "im:message.reactions:write_only", "im:chat:read",
+        "im:resource", "cardkit:card:write", "cardkit:card:read",
+    ]
+    for i, s in enumerate(scopes):
+        comma = "," if i < len(scopes) - 1 else ""
+        print(f'       {CYAN}"{s}"{comma}{RESET}')
+    print(f'     {CYAN}], "user": []}}}}{RESET}\n')
+
+    print(f"  {BOLD}3. 事件订阅{RESET}")
+    print(f"     事件与回调 → 事件配置")
+    print(f"     请求方式: 长连接（无需公网 IP）")
+    print(f"     添加事件: {GREEN}im.message.receive_v1{RESET}")
+    print(f"     添加回调: {GREEN}card.action.trigger{RESET}\n")
+
+    print(f"  {BOLD}4. 发布版本{RESET}")
+    print(f"     版本管理 → 创建版本 → 提交审核 → 管理员审批\n")
+
+    print(f"  {BOLD}5. 开始使用{RESET}")
+    print(f"     在飞书中搜索机器人名称，发起单聊或拉入群聊\n")
+
+
 # ── Dashboard ─────────────────────────────────────────────────────────
 
 
