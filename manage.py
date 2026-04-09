@@ -172,7 +172,12 @@ def is_cc_running() -> tuple[bool, int | None]:
 
 
 def restart_cc() -> bool:
-    """Restart cc-connect daemon."""
+    """Restart cc-connect daemon.
+
+    Tries `cc-connect daemon restart` first.  If that fails (common launchctl
+    I/O error on macOS), falls back to killing the process directly and letting
+    launchd's KeepAlive respawn it.
+    """
     print(f"\n  {DIM}正在重启 cc-connect...{RESET}")
     try:
         result = subprocess.run(
@@ -182,13 +187,45 @@ def restart_cc() -> bool:
         if result.returncode == 0:
             info("cc-connect 已重启")
             return True
-        else:
-            err("重启失败")
-            if result.stderr:
-                print(f"  {DIM}{result.stderr.strip()}{RESET}")
-            return False
     except FileNotFoundError:
         err("cc-connect 未安装或不在 PATH 中")
+        return False
+
+    # Fallback: kill the process and let launchd KeepAlive respawn it
+    warn("daemon restart 失败，尝试 kill 重启...")
+    running, pid = is_cc_running()
+    if not running or pid is None:
+        # Try pgrep as a last resort
+        try:
+            pgrep = subprocess.run(
+                ["pgrep", "-f", "cc-connect"],
+                capture_output=True, text=True,
+            )
+            if pgrep.returncode == 0:
+                pid = int(pgrep.stdout.strip().splitlines()[0])
+        except (ValueError, IndexError, FileNotFoundError):
+            pass
+
+    if pid:
+        import signal
+        import time
+        try:
+            os.kill(pid, signal.SIGTERM)
+            time.sleep(2)
+            # Verify new process came up
+            new_running, new_pid = is_cc_running()
+            if new_running and new_pid != pid:
+                info(f"cc-connect 已重启 (PID {new_pid})")
+                return True
+            else:
+                err("kill 后服务未自动重启，请手动启动")
+                print(f"  {DIM}cc-connect --config ~/.cc-connect/config.toml{RESET}")
+                return False
+        except ProcessLookupError:
+            warn("进程已不存在")
+            return False
+    else:
+        err("找不到 cc-connect 进程")
         return False
 
 
