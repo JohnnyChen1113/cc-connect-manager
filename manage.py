@@ -10,6 +10,7 @@ import getpass
 import json
 import os
 import platform
+import re
 import shutil
 import signal
 import subprocess
@@ -1618,6 +1619,257 @@ def do_help() -> None:
     pause_return("按回车返回主菜单...")
 
 
+# ── Desktop session import ────────────────────────────────────────────
+
+CLAUDE_PROJECTS_DIR = Path.home() / ".claude" / "projects"
+
+
+def _encode_work_dir(path: str) -> str:
+    """Claude Code encodes project paths by replacing every non-alphanumeric
+    character with '-' (so /Users/johnny/LLM_wiki → -Users-johnny-LLM-wiki)."""
+    return re.sub(r"[^A-Za-z0-9]", "-", path)
+
+
+def _extract_user_text(content) -> str:
+    """Pull plain text out of a message content that may be str or list-of-parts."""
+    if isinstance(content, str):
+        return content.strip()
+    if isinstance(content, list):
+        for item in content:
+            if isinstance(item, dict) and item.get("type") == "text":
+                text = item.get("text", "")
+                if text.strip():
+                    return text.strip()
+    return ""
+
+
+def _parse_desktop_session(jsonl: Path) -> dict | None:
+    """Return {uuid, first_user_msg, turn_count, mtime} for a Claude Code session."""
+    try:
+        stat = jsonl.stat()
+    except OSError:
+        return None
+
+    first_user_msg = ""
+    turn_count = 0
+    try:
+        with jsonl.open() as f:
+            for line in f:
+                try:
+                    entry = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                if entry.get("type") == "user":
+                    turn_count += 1
+                    if not first_user_msg:
+                        first_user_msg = _extract_user_text(
+                            entry.get("message", {}).get("content", "")
+                        )
+    except OSError:
+        return None
+
+    return {
+        "uuid": jsonl.stem,
+        "first_user_msg": first_user_msg,
+        "turn_count": turn_count,
+        "mtime": stat.st_mtime,
+    }
+
+
+def _scan_desktop_sessions(work_dir: str) -> list[dict]:
+    """Find Claude Code sessions whose project dir matches work_dir."""
+    proj_dir = CLAUDE_PROJECTS_DIR / _encode_work_dir(work_dir)
+    if not proj_dir.is_dir():
+        return []
+    sessions = [
+        meta for jsonl in proj_dir.glob("*.jsonl")
+        if (meta := _parse_desktop_session(jsonl))
+    ]
+    sessions.sort(key=lambda s: s["mtime"], reverse=True)
+    return sessions
+
+
+def _cc_session_preview(path: Path) -> str:
+    """Pull the most recent message text from a cc-connect session file."""
+    try:
+        data = json.loads(path.read_text())
+    except (json.JSONDecodeError, OSError):
+        return ""
+    latest_ts = ""
+    latest_content = ""
+    for sess in data.get("sessions", {}).values():
+        for msg in reversed(sess.get("history", [])):
+            ts = msg.get("timestamp", "")
+            if ts > latest_ts:
+                latest_ts = ts
+                content = msg.get("content", "")
+                if isinstance(content, str):
+                    latest_content = content
+                break
+    return latest_content
+
+
+def do_import_session() -> None:
+    """Point a Feishu chat's agent_session_id at an existing desktop Claude Code session
+    so conversations started on the desktop continue via the bot."""
+    header("导入桌面 Session")
+
+    doc = load_config()
+    projects = get_projects(doc)
+    if not projects:
+        warn("暂无项目。请先 [a] 添加项目")
+        return
+
+    show_dashboard(doc)
+    proj_idx = pick_project(projects, "导入到")
+    if proj_idx is None:
+        return
+
+    proj = projects[proj_idx]
+    proj_name = proj.get("name", "")
+    work_dir = proj.get("agent", {}).get("options", {}).get("work_dir", "")
+    if not work_dir:
+        err("该项目没有配置 work_dir。")
+        return
+
+    print(f"\n  {DIM}扫描 {work_dir} 下的桌面 session...{RESET}")
+    desktop_sessions = _scan_desktop_sessions(work_dir)
+    if not desktop_sessions:
+        err("未找到桌面 session")
+        print(f"  {DIM}预期路径: ~/.claude/projects/{_encode_work_dir(work_dir)}/{RESET}")
+        print(f"  {DIM}若 work_dir 最近改过，旧会话可能在其他编码目录下{RESET}")
+        return
+
+    recent = desktop_sessions[:20]
+    print(f"\n  {BOLD}{'#':<4}{'UUID':<11}{'轮次':<6}{'最近活跃':<20}{'首句'}{RESET}")
+    print(f"  {DIM}{'─' * 110}{RESET}")
+    for i, s in enumerate(recent, 1):
+        mtime_str = datetime.fromtimestamp(s["mtime"]).strftime("%Y-%m-%d %H:%M")
+        preview = (s["first_user_msg"] or "(空)")[:60].replace("\n", " ")
+        print(f"  {i:<4}{s['uuid'][:8]:<11}{s['turn_count']:<6}{mtime_str:<20}{preview}")
+
+    idx = pick_index("选择要导入的桌面 session", len(recent))
+    if idx is None:
+        return
+    desktop = recent[idx]
+
+    cc_files = sorted(SESSIONS_DIR.glob(f"{proj_name}_*.json"))
+    if not cc_files:
+        err(f"项目 '{proj_name}' 还没有任何飞书 session 文件")
+        print(f"  {DIM}请先在飞书里给机器人发一条消息激活，然后回来再试{RESET}")
+        return
+
+    if len(cc_files) == 1:
+        cc_file = cc_files[0]
+        info(f"该项目只有一个飞书聊天: {cc_file.name}")
+    else:
+        print(f"\n  {BOLD}该项目有 {len(cc_files)} 个飞书聊天：{RESET}")
+        print(f"  {BOLD}{'#':<4}{'文件':<36}{'最近消息预览'}{RESET}")
+        print(f"  {DIM}{'─' * 110}{RESET}")
+        for i, f in enumerate(cc_files, 1):
+            preview = _cc_session_preview(f)[:60].replace("\n", " ") or "(空)"
+            print(f"  {i:<4}{f.name:<36}{preview}")
+        chat_idx = pick_index("选择要导入到的飞书聊天", len(cc_files))
+        if chat_idx is None:
+            return
+        cc_file = cc_files[chat_idx]
+
+    try:
+        cc_data = json.loads(cc_file.read_text())
+    except (json.JSONDecodeError, OSError) as e:
+        err(f"读取 {cc_file.name} 失败: {e}")
+        return
+    slots = cc_data.setdefault("sessions", {})
+    slot_keys = sorted(slots.keys())
+
+    print(f"\n  {BOLD}选择要绑定到的命名槽位：{RESET}")
+    for i, sid in enumerate(slot_keys, 1):
+        s = slots[sid]
+        current_uuid = (s.get("agent_session_id") or "")[:8] or "(空)"
+        name = s.get("name", "")
+        print(f"  {i}) 覆盖 {sid} ({name}) — 当前 UUID: {current_uuid}")
+    next_slot_num = (max((int(k[1:]) for k in slot_keys if k.startswith("s") and k[1:].isdigit()), default=0) + 1)
+    next_slot = f"s{next_slot_num}"
+    print(f"  {len(slot_keys) + 1}) 新建 {next_slot}")
+
+    slot_idx = pick_index("选择槽位", len(slot_keys) + 1)
+    if slot_idx is None:
+        return
+    is_new = slot_idx == len(slot_keys)
+    target_slot = next_slot if is_new else slot_keys[slot_idx]
+
+    print(f"\n  {BOLD}变更预览：{RESET}")
+    print(f"    项目:        {proj_name}")
+    print(f"    桌面 UUID:    {desktop['uuid']} ({desktop['turn_count']} 轮)")
+    if desktop["first_user_msg"]:
+        print(f"    首句:        {desktop['first_user_msg'][:60]}")
+    print(f"    飞书文件:    {cc_file.name}")
+    if is_new:
+        print(f"    槽位:        新建 {target_slot}")
+    else:
+        old_uuid = (slots[target_slot].get("agent_session_id") or "")[:8]
+        print(f"    槽位:        覆盖 {target_slot} (原 UUID: {old_uuid})")
+    print(f"    {DIM}原文件会先备份，daemon 会 stop → write → start{RESET}")
+    print()
+
+    if not ask_confirm("确认导入？"):
+        print("  已取消。")
+        return
+
+    timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+    backup_path = cc_file.with_suffix(f".json.bak.{timestamp}")
+    try:
+        backup_path.write_text(cc_file.read_text())
+        info(f"原文件已备份: {backup_path.name}")
+    except OSError as e:
+        err(f"备份失败，中止: {e}")
+        return
+
+    was_running, _ = is_cc_running()
+    if was_running:
+        print(f"  {DIM}停止 daemon...{RESET}")
+        cc_cmd("daemon", "stop")
+        time.sleep(1)
+
+    if is_new:
+        slots[target_slot] = {
+            "id": target_slot,
+            "name": "imported",
+            "agent_session_id": desktop["uuid"],
+            "history": [],
+        }
+    else:
+        slots[target_slot]["agent_session_id"] = desktop["uuid"]
+        slots[target_slot]["history"] = []
+
+    try:
+        cc_file.write_text(json.dumps(cc_data, ensure_ascii=False, indent=2))
+        info(f"已写入 {cc_file.name}")
+    except OSError as e:
+        err(f"写入失败: {e}")
+        if was_running:
+            cc_cmd("daemon", "start")
+        return
+
+    if was_running:
+        print(f"  {DIM}启动 daemon...{RESET}")
+        cc_cmd("daemon", "start")
+        time.sleep(1)
+        running, pid = is_cc_running()
+        if running:
+            info(f"daemon 已启动 (PID {pid})")
+        else:
+            warn("daemon 未启动，用 [r] 重启一次")
+
+    print()
+    info("导入完成 ✨")
+    print(f"  {DIM}下次在该飞书聊天里发消息，会接上桌面对话的上下文{RESET}")
+    if not is_new and target_slot != "s1":
+        print(f"  {DIM}槽位不是 s1，若飞书侧没自动选中，先输 /switch {target_slot}{RESET}")
+    elif is_new:
+        print(f"  {DIM}新槽位，若飞书侧没自动切，先输 /switch {target_slot}{RESET}")
+
+
 # ── Install wizard ────────────────────────────────────────────────────
 
 
@@ -2298,11 +2550,12 @@ def main() -> None:
             f"{BOLD}[d]{RESET} 删除  "
             f"{BOLD}[w]{RESET} 复用  "
             f"{BOLD}[m]{RESET} 模型/服务商  "
-            f"{BOLD}[c]{RESET} 定时任务  "
-            f"{BOLD}[l]{RESET} 日志"
+            f"{BOLD}[s]{RESET} 导入桌面Session  "
+            f"{BOLD}[c]{RESET} 定时任务"
         )
         print(
-            f"  {BOLD}[h]{RESET} 命令参考  "
+            f"  {BOLD}[l]{RESET} 日志  "
+            f"{BOLD}[h]{RESET} 命令参考  "
             f"{BOLD}[g]{RESET} 高级设置  "
             f"{BOLD}[b]{RESET} 备份/恢复  "
             f"{BOLD}[r]{RESET} 重启  "
@@ -2328,6 +2581,8 @@ def main() -> None:
                 do_reuse()
             case "m":
                 do_model()
+            case "s":
+                do_import_session()
             case "c":
                 do_cron()
             case "l":
