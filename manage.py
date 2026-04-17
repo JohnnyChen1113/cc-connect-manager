@@ -15,6 +15,8 @@ import signal
 import subprocess
 import sys
 import time
+import zipfile
+from datetime import datetime
 from pathlib import Path
 
 try:
@@ -176,60 +178,105 @@ def is_cc_running() -> tuple[bool, int | None]:
     return False, None
 
 
-def restart_cc() -> bool:
-    """Restart cc-connect daemon.
-
-    Tries `cc-connect daemon restart` first.  If that fails (common launchctl
-    I/O error on macOS), falls back to killing the process directly and letting
-    launchd's KeepAlive respawn it.
-    """
-    print(f"\n  {DIM}正在重启 cc-connect...{RESET}")
+def _daemon_cmd(subcmd: str) -> tuple[int, str, str]:
+    """Run `cc-connect daemon <subcmd>`. Returns (rc, stdout, stderr).
+    rc = -1 if cc-connect is not found."""
     try:
         result = subprocess.run(
-            ["cc-connect", "daemon", "restart"],
+            ["cc-connect", "daemon", subcmd],
             capture_output=True, text=True,
         )
-        if result.returncode == 0:
-            info("cc-connect 已重启")
-            return True
+        return result.returncode, result.stdout, result.stderr
     except FileNotFoundError:
+        return -1, "", "cc-connect not found"
+
+
+def _find_cc_pid() -> int | None:
+    """Return PID of running cc-connect, via status or pgrep fallback."""
+    running, pid = is_cc_running()
+    if running and pid is not None:
+        return pid
+    try:
+        pgrep = subprocess.run(
+            ["pgrep", "-f", "cc-connect"],
+            capture_output=True, text=True,
+        )
+        if pgrep.returncode == 0:
+            for line in pgrep.stdout.strip().splitlines():
+                try:
+                    return int(line)
+                except ValueError:
+                    continue
+    except FileNotFoundError:
+        pass
+    return None
+
+
+def restart_cc() -> bool:
+    """Restart cc-connect daemon with cascading fallbacks.
+
+    Attempts in order:
+      1. `cc-connect daemon restart`
+      2. kill PID + wait 2s for launchd KeepAlive to respawn
+      3. explicit `cc-connect daemon restart` (now that nothing is running)
+      4. `cc-connect daemon start` as last resort
+
+    Only returns False if all four fail.
+    """
+    print(f"\n  {DIM}正在重启 cc-connect...{RESET}")
+
+    # Attempt 1: daemon restart
+    rc, _, _ = _daemon_cmd("restart")
+    if rc == -1:
         err("cc-connect 未安装或不在 PATH 中")
         return False
+    if rc == 0:
+        time.sleep(1)
+        running, pid = is_cc_running()
+        if running:
+            info(f"cc-connect 已重启 (PID {pid})")
+            return True
 
-    # Fallback: kill the process and let launchd KeepAlive respawn it
-    warn("daemon restart 失败，尝试 kill 重启...")
-    running, pid = is_cc_running()
-    if not running or pid is None:
-        # Try pgrep as a last resort
-        try:
-            pgrep = subprocess.run(
-                ["pgrep", "-f", "cc-connect"],
-                capture_output=True, text=True,
-            )
-            if pgrep.returncode == 0:
-                pid = int(pgrep.stdout.strip().splitlines()[0])
-        except (ValueError, IndexError, FileNotFoundError):
-            pass
-
+    # Attempt 2: kill the process and wait for launchd KeepAlive
+    warn("daemon restart 失败，尝试 kill 进程...")
+    pid = _find_cc_pid()
     if pid:
         try:
             os.kill(pid, signal.SIGTERM)
-            time.sleep(2)
-            # Verify new process came up
-            new_running, new_pid = is_cc_running()
-            if new_running and new_pid != pid:
-                info(f"cc-connect 已重启 (PID {new_pid})")
-                return True
-            else:
-                err("kill 后服务未自动重启，请手动启动")
-                print(f"  {DIM}cc-connect --config ~/.cc-connect/config.toml{RESET}")
-                return False
         except ProcessLookupError:
-            warn("进程已不存在")
-            return False
-    else:
-        err("找不到 cc-connect 进程")
-        return False
+            pass
+        time.sleep(2)
+
+    running, new_pid = is_cc_running()
+    if running and new_pid != pid:
+        info(f"cc-connect 已重启 (PID {new_pid})")
+        return True
+
+    # Attempt 3: explicit restart (no process should be running now)
+    print(f"  {DIM}launchd 未触发，显式启动...{RESET}")
+    rc, _, _ = _daemon_cmd("restart")
+    if rc == 0:
+        time.sleep(1)
+        running, new_pid = is_cc_running()
+        if running:
+            info(f"cc-connect 已重启 (PID {new_pid})")
+            return True
+
+    # Attempt 4: daemon start
+    rc, _, stderr = _daemon_cmd("start")
+    if rc == 0:
+        time.sleep(1)
+        running, new_pid = is_cc_running()
+        if running:
+            info(f"cc-connect 已启动 (PID {new_pid})")
+            return True
+
+    err("多次尝试均失败，请手动排查")
+    if stderr:
+        print(f"  {DIM}最后错误: {stderr.strip()}{RESET}")
+    print(f"  {DIM}手动启动: cc-connect daemon start{RESET}")
+    print(f"  {DIM}查看日志: cc-connect daemon logs -n 50{RESET}")
+    return False
 
 
 def prompt_restart() -> None:
@@ -1307,6 +1354,286 @@ def do_model() -> None:
             err("无效选择。")
 
 
+# ── Slash command reference ───────────────────────────────────────────
+
+
+# Grouped so users can find by intent, not alphabet
+SLASH_COMMAND_GROUPS = [
+    ("常用操作", [
+        ("/stop",     "打断正在执行的 agent（相当于 Ctrl+C）"),
+        ("/new",      "开一个新 session（等于 reset 对话）"),
+        ("/compress", "压缩当前上下文，保留关键信息继续对话"),
+        ("/history",  "查看最近消息，可加数字如 /history 20"),
+        ("/help",     "在飞书里输入这个看完整说明"),
+    ]),
+    ("切换模型 / 模式 / 服务商", [
+        ("/model",    "切换模型（不用进 manage.py）"),
+        ("/mode",     "切换模式：code / plan / ask / auto-edit / full-auto"),
+        ("/provider", "管理第三方 API 服务商"),
+        ("/quiet",    "开关静默模式（隐藏思考和工具调用过程）"),
+    ]),
+    ("权限 / 技能 / 语言", [
+        ("/allow",    "允许某个工具使用（如 /allow Bash）"),
+        ("/skills",   "列出当前 agent 可用的 skills"),
+        ("/lang",     "切换界面语言: en / zh / zh-TW / ja / es / auto"),
+        ("/config",   "查看或修改配置: /config get|set|reload [key] [value]"),
+    ]),
+    ("扩展命令", [
+        ("/commands", "管理自定义命令: /commands add|del"),
+        ("/alias",    "命令别名: /alias add 帮助 /help"),
+        ("/cron",     "定时任务: /cron add|list|del|enable|disable"),
+        ("/search",   "搜索历史消息"),
+        ("/memory",   "管理长期记忆: /memory add|global"),
+    ]),
+    ("系统", [
+        ("/status",   "查看当前 session 状态"),
+        ("/restart",  "重启 cc-connect（等同 manage.py 的 [r]）"),
+        ("/doctor",   "诊断当前环境"),
+        ("/version",  "查看 cc-connect 版本"),
+        ("/upgrade",  "升级 cc-connect 二进制"),
+    ]),
+]
+
+
+CRONS_FILE = CC_DIR / "crons" / "jobs.json"
+
+
+def _load_crons() -> list[dict]:
+    """Load cron jobs from ~/.cc-connect/crons/jobs.json."""
+    if not CRONS_FILE.exists():
+        return []
+    try:
+        data = json.loads(CRONS_FILE.read_text())
+        return data if isinstance(data, list) else []
+    except (json.JSONDecodeError, OSError):
+        return []
+
+
+def _save_crons(jobs: list[dict]) -> bool:
+    """Persist cron jobs back to jobs.json."""
+    try:
+        CRONS_FILE.parent.mkdir(parents=True, exist_ok=True)
+        CRONS_FILE.write_text(json.dumps(jobs, ensure_ascii=False, indent=2))
+        return True
+    except OSError as e:
+        err(f"写入失败: {e}")
+        return False
+
+
+def _show_cron_list(jobs: list[dict]) -> None:
+    """Pretty-print the cron jobs table."""
+    if not jobs:
+        print(f"  {DIM}暂无定时任务{RESET}")
+        return
+    print()
+    print(f"  {BOLD}{'#':<4}{'状态':<6}{'ID':<12}{'Cron':<16}{'项目':<20}{'描述'}{RESET}")
+    print(f"  {DIM}{'─' * 110}{RESET}")
+    for i, job in enumerate(jobs, 1):
+        enabled = job.get("enabled", True)
+        icon = f"{GREEN}✓{RESET}" if enabled else f"{DIM}✗{RESET}"
+        job_id = job.get("id", "?")[:10]
+        expr = job.get("cron_expr", "-")
+        project = job.get("project", "-")
+        desc = job.get("description", "") or job.get("prompt", "")[:40]
+        if len(desc) > 40:
+            desc = desc[:39] + "…"
+        last_error = job.get("last_error", "")
+        print(f"  {i:<4}{icon:<13}{job_id:<12}{expr:<16}{project:<20}{desc}")
+        if last_error:
+            print(f"      {DIM}└ 上次错误: {last_error[:80]}{RESET}")
+    print()
+
+
+def do_cron() -> None:
+    """Manage cron jobs."""
+    header("定时任务")
+
+    jobs = _load_crons()
+    _show_cron_list(jobs)
+
+    print(f"  {BOLD}操作:{RESET}")
+    print(f"  1) 删除任务")
+    print(f"  2) 启用/禁用任务")
+    print(f"  3) 查看任务详情")
+    print(f"  4) 添加新任务（说明）")
+    print(f"  5) 刷新列表")
+    print(f"  6) 返回")
+
+    choice = ask("选择")
+
+    if choice == "1":
+        if not jobs:
+            return
+        idx = ask("要删除的任务编号")
+        try:
+            i = int(idx) - 1
+        except ValueError:
+            err("请输入数字。")
+            return
+        if i < 0 or i >= len(jobs):
+            err("无效编号。")
+            return
+        job_id = jobs[i].get("id", "")
+        desc = jobs[i].get("description", "") or jobs[i].get("prompt", "")[:40]
+        if not ask_confirm(f"确认删除 '{desc}' (ID: {job_id[:10]})？", default_yes=False):
+            return
+        try:
+            result = subprocess.run(
+                ["cc-connect", "cron", "del", job_id],
+                capture_output=True, text=True,
+            )
+            if result.returncode == 0:
+                info(f"已删除任务 {job_id[:10]}")
+                prompt_restart()
+            else:
+                err(f"删除失败: {result.stderr.strip() or result.stdout.strip()}")
+        except FileNotFoundError:
+            err("cc-connect 未安装")
+
+    elif choice == "2":
+        if not jobs:
+            return
+        idx = ask("要切换状态的任务编号")
+        try:
+            i = int(idx) - 1
+        except ValueError:
+            err("请输入数字。")
+            return
+        if i < 0 or i >= len(jobs):
+            err("无效编号。")
+            return
+        job = jobs[i]
+        job["enabled"] = not job.get("enabled", True)
+        new_state = "启用" if job["enabled"] else "禁用"
+        if _save_crons(jobs):
+            info(f"已{new_state}任务 {job.get('id', '')[:10]}")
+            prompt_restart()
+
+    elif choice == "3":
+        if not jobs:
+            return
+        idx = ask("要查看详情的任务编号")
+        try:
+            i = int(idx) - 1
+        except ValueError:
+            err("请输入数字。")
+            return
+        if i < 0 or i >= len(jobs):
+            err("无效编号。")
+            return
+        job = jobs[i]
+        print(f"\n  {BOLD}任务详情{RESET}")
+        print(f"  ID:         {job.get('id', '-')}")
+        print(f"  项目:       {job.get('project', '-')}")
+        print(f"  Cron:       {job.get('cron_expr', '-')}")
+        print(f"  描述:       {job.get('description', '-')}")
+        print(f"  状态:       {'启用' if job.get('enabled', True) else '禁用'}")
+        print(f"  创建时间:    {job.get('created_at', '-')}")
+        print(f"  上次执行:    {job.get('last_run', '-') or '—'}")
+        if job.get("last_error"):
+            print(f"  {YELLOW}上次错误:    {job['last_error']}{RESET}")
+        print(f"\n  {BOLD}Prompt:{RESET}")
+        prompt = job.get("prompt", "")
+        for line in prompt.splitlines() or [prompt]:
+            print(f"    {line}")
+        input(f"\n  {DIM}按回车返回...{RESET}")
+
+    elif choice == "4":
+        print(f"\n  {BOLD}添加新的定时任务{RESET}\n")
+        print(f"  添加 cron 需要 session-key（绑定到具体的聊天窗口），")
+        print(f"  从 manage.py 外部很难拿到。{GREEN}推荐做法{RESET}：\n")
+        print(f"  1. 在飞书里打开要添加任务的对话")
+        print(f"  2. 输入: {GREEN}/cron add <min> <hour> <day> <month> <weekday> <你的 prompt>{RESET}")
+        print(f"  {DIM}   例: /cron add 0 9 * * * 每天早上给我一份今日日程汇总{RESET}")
+        print(f"  3. 创建后回来这里 [c] 就能看到\n")
+        input(f"  {DIM}按回车返回...{RESET}")
+
+    elif choice == "5":
+        return do_cron()
+
+    elif choice in ("6", ""):
+        return
+    else:
+        err("无效选择。")
+
+
+def do_logs() -> None:
+    """View cc-connect daemon logs."""
+    header("查看日志")
+
+    print(f"\n  {BOLD}选择查看方式:{RESET}")
+    print(f"  1) 最近 50 条（快速回顾）")
+    print(f"  2) 最近 200 条")
+    print(f"  3) 实时跟随 (Ctrl+C 退出)")
+    print(f"  4) 只看错误和警告（最近 100 条里过滤）")
+    print(f"  5) 返回")
+
+    choice = ask("选择")
+    try:
+        if choice == "1":
+            cmd = ["cc-connect", "daemon", "logs", "-n", "50"]
+            subprocess.run(cmd)
+        elif choice == "2":
+            cmd = ["cc-connect", "daemon", "logs", "-n", "200"]
+            subprocess.run(cmd)
+        elif choice == "3":
+            print(f"\n  {DIM}实时日志（按 Ctrl+C 返回菜单）{RESET}\n")
+            try:
+                subprocess.run(["cc-connect", "daemon", "logs", "-f"])
+            except KeyboardInterrupt:
+                print(f"\n  {DIM}已停止跟随{RESET}")
+        elif choice == "4":
+            result = subprocess.run(
+                ["cc-connect", "daemon", "logs", "-n", "100"],
+                capture_output=True, text=True,
+            )
+            lines = result.stdout.splitlines()
+            matched = [ln for ln in lines if "level=ERROR" in ln or "level=WARN" in ln]
+            if not matched:
+                info("最近 100 条里没有错误或警告")
+            else:
+                print()
+                for line in matched:
+                    color = RED if "level=ERROR" in line else YELLOW
+                    print(f"  {color}{line}{RESET}")
+                print(f"\n  {DIM}共 {len(matched)} 条{RESET}")
+        elif choice in ("5", ""):
+            return
+        else:
+            err("无效选择。")
+            return
+    except FileNotFoundError:
+        err("cc-connect 未安装或不在 PATH 中")
+        return
+
+    input(f"\n  {DIM}按回车返回主菜单...{RESET}")
+
+
+def do_help() -> None:
+    """Show cc-connect slash command reference."""
+    header("命令参考 — 在飞书对话里直接输入")
+
+    print(f"\n  {DIM}这些命令在飞书/Lark/其他平台的对话框里输入即可使用{RESET}")
+    print(f"  {DIM}不需要回到 manage.py，也不需要重启服务{RESET}\n")
+
+    for group_name, commands in SLASH_COMMAND_GROUPS:
+        print(f"  {BOLD}── {group_name} ──{RESET}")
+        for cmd, desc in commands:
+            print(f"    {GREEN}{cmd:<12}{RESET} {desc}")
+        print()
+
+    print(f"  {BOLD}常见场景速查:{RESET}")
+    print(f"    {DIM}机器人答非所问 → {RESET}{GREEN}/stop{RESET} 然后 {GREEN}/new{RESET}")
+    print(f"    {DIM}想换个模型试试 → {RESET}{GREEN}/model{RESET}")
+    print(f"    {DIM}上下文太长有点慢 → {RESET}{GREEN}/compress{RESET}")
+    print(f"    {DIM}想让机器人安静点 → {RESET}{GREEN}/quiet{RESET}")
+    print(f"    {DIM}要禁用某个工具 → {RESET}{GREEN}/config set ...{RESET}  或编辑 config.toml")
+    print()
+
+    print(f"  {DIM}在飞书里输入 {GREEN}/help{RESET}{DIM} 可以看到 cc-connect 当前实际支持的完整命令（可能随版本更新）{RESET}")
+    input(f"\n  {DIM}按回车返回主菜单...{RESET}")
+
+
 # ── Install wizard ────────────────────────────────────────────────────
 
 
@@ -1414,8 +1741,8 @@ def _setup_launchd(cc_path: str) -> bool:
         return False
 
 
-def do_install() -> None:
-    """Interactive installation wizard for cc-connect."""
+def _do_install_or_update() -> None:
+    """Install or update cc-connect."""
     header("安装 / 更新 cc-connect")
 
     # Step 1: Check current state
@@ -1499,6 +1826,502 @@ def do_install() -> None:
     info("安装完成！接下来可以用 [a] 添加项目")
 
 
+def _check_item(label: str, ok: bool, detail: str = "", severity: str = "error") -> bool:
+    """severity: 'error' (red ✗) or 'warn' (yellow !)."""
+    if ok:
+        icon = f"{GREEN}✓{RESET}"
+    elif severity == "warn":
+        icon = f"{YELLOW}!{RESET}"
+    else:
+        icon = f"{RED}✗{RESET}"
+    suffix = f"  {DIM}{detail}{RESET}" if detail else ""
+    print(f"  {icon} {label}{suffix}")
+    return ok
+
+
+def _do_health_check() -> None:
+    """Run environment health checks."""
+    header("环境体检")
+
+    print()
+    all_ok = True
+
+    # 1. cc-connect binary
+    cc_path = _find_cc_connect()
+    if cc_path:
+        ver = _get_cc_version() or "unknown"
+        _check_item(f"cc-connect 可执行文件", True, f"{cc_path} ({ver})")
+    else:
+        _check_item("cc-connect 可执行文件", False, "PATH 中未找到 — 请运行 [i] → 1 安装")
+        all_ok = False
+
+    # 2. Node.js
+    try:
+        r = subprocess.run(["node", "--version"], capture_output=True, text=True, timeout=3)
+        if r.returncode == 0:
+            _check_item("Node.js", True, r.stdout.strip())
+        else:
+            _check_item("Node.js", False, "命令失败")
+            all_ok = False
+    except (FileNotFoundError, subprocess.TimeoutExpired):
+        _check_item("Node.js", False, "未安装或无法访问")
+        all_ok = False
+
+    # 3. Python + tomlkit
+    _check_item(
+        f"Python {sys.version_info.major}.{sys.version_info.minor}",
+        sys.version_info >= (3, 10),
+        "需要 3.10+" if sys.version_info < (3, 10) else "",
+    )
+    _check_item("tomlkit 模块", True, tomlkit.__version__ if hasattr(tomlkit, "__version__") else "已加载")
+
+    # 4. config.toml
+    if CONFIG_FILE.exists():
+        try:
+            doc = tomlkit.parse(CONFIG_FILE.read_text())
+            projects = doc.get("projects", [])
+            _check_item("config.toml 存在并可解析", True, f"{len(projects)} 个项目")
+        except Exception as e:
+            _check_item("config.toml 存在并可解析", False, f"解析失败: {e}")
+            all_ok = False
+    else:
+        _check_item("config.toml", False, f"不存在: {CONFIG_FILE}")
+        all_ok = False
+
+    # 5. daemon running
+    running, pid = is_cc_running()
+    if running:
+        _check_item("cc-connect daemon 运行中", True, f"PID {pid}")
+    else:
+        _check_item("cc-connect daemon 运行中", False, "未运行 — 按 [r] 启动")
+        all_ok = False
+
+    # 6. launchd plist
+    if LAUNCHD_PLIST.exists():
+        _check_item("launchd 开机自启配置", True, str(LAUNCHD_PLIST))
+    else:
+        _check_item("launchd 开机自启配置", False, "未注册 — 运行 [i] → 1")
+
+    # 7. Directories
+    for sub in ("sessions", "logs", "crons", "run"):
+        path = CC_DIR / sub
+        _check_item(f"目录 ~/.cc-connect/{sub}", path.is_dir(), "" if path.is_dir() else "缺失")
+
+    # 8. Session files — basic sanity
+    if (CC_DIR / "sessions").is_dir():
+        session_files = list((CC_DIR / "sessions").glob("*.json"))
+        _check_item(
+            f"Session 文件",
+            len(session_files) > 0,
+            f"{len(session_files)} 个" if session_files else "暂无（第一次收到消息后会生成）",
+        )
+
+    # 9. Cron jobs (non-blocking — errors here are often transient)
+    jobs = _load_crons()
+    if jobs:
+        failing = [j for j in jobs if j.get("last_error")]
+        ok = len(failing) == 0
+        detail = f"{len(jobs)} 个任务"
+        if failing:
+            detail += f"，其中 {len(failing)} 个上次执行有错（可能是临时问题）"
+        _check_item("定时任务健康", ok, detail, severity="warn")
+        if failing:
+            print(f"  {DIM}   在 [c] → 3 可查看任务详情和错误原因{RESET}")
+
+    # 10. provider DB (at cc-connect's default location — not inspecting contents, just existence)
+    providers_data = get_all_providers()
+    total_providers = sum(len(v) for v in providers_data.values())
+    if total_providers > 0:
+        _check_item("第三方 provider 注册", True, f"{total_providers} 个")
+
+    print()
+    if all_ok:
+        info("✨ 所有核心项健康")
+    else:
+        warn("有问题项目，参考上面的提示处理")
+    print()
+    input(f"  {DIM}按回车返回...{RESET}")
+
+
+BACKUP_DIR = Path.home() / ".cc-connect-manager" / "backups"
+
+
+def _backup_paths(include_sessions: bool) -> list[tuple[Path, str]]:
+    """Return (source, arcname) pairs for backup contents."""
+    pairs: list[tuple[Path, str]] = []
+    if CONFIG_FILE.exists():
+        pairs.append((CONFIG_FILE, "config.toml"))
+    crons_file = CC_DIR / "crons" / "jobs.json"
+    if crons_file.exists():
+        pairs.append((crons_file, "crons/jobs.json"))
+    # cc-switch provider DB (location may vary — try common spots)
+    for p in (CC_DIR / "cc-switch.db", Path.home() / ".cc-switch.db"):
+        if p.exists():
+            pairs.append((p, p.name))
+    if include_sessions and (CC_DIR / "sessions").is_dir():
+        for f in (CC_DIR / "sessions").glob("*.json"):
+            pairs.append((f, f"sessions/{f.name}"))
+    return pairs
+
+
+def _first_run_hint() -> None:
+    """Show a one-time onboarding banner when the user hasn't set anything up."""
+    cc_path = _find_cc_connect()
+    has_config = CONFIG_FILE.exists()
+    has_projects = False
+    if has_config:
+        try:
+            doc = tomlkit.parse(CONFIG_FILE.read_text())
+            has_projects = bool(doc.get("projects"))
+        except Exception:
+            pass
+    has_plist = LAUNCHD_PLIST.exists()
+
+    # Everything set up — no banner
+    if cc_path and has_config and has_projects and has_plist:
+        return
+
+    print()
+    print(f"  {CYAN}╭─ 建议的 3 步开始 ─────────────────────────────────╮{RESET}")
+    steps = []
+    if not cc_path:
+        steps.append(("[i] → 1", "安装 cc-connect"))
+    elif not has_plist:
+        steps.append(("[i] → 1", "重新注册 launchd 开机自启"))
+    if not has_projects:
+        steps.append(("[a]", "添加第一个飞书项目（准备好 App ID + Secret）"))
+    else:
+        steps.append(("[r]", "确保 daemon 在运行"))
+    steps.append(("[h]", "查看聊天里能用的 slash 命令"))
+
+    for i, (key, desc) in enumerate(steps[:3], 1):
+        print(f"  {CYAN}│{RESET}  {i}. {BOLD}{key:<10}{RESET} {desc}")
+    print(f"  {CYAN}│{RESET}")
+    print(f"  {CYAN}│{RESET}  {DIM}体检环境: [i] → 2    命令参考: [h]{RESET}")
+    print(f"  {CYAN}╰──────────────────────────────────────────────────╯{RESET}")
+
+
+# ── Advanced settings wizard ──────────────────────────────────────────
+
+
+def _ensure_table(doc: tomlkit.TOMLDocument, key: str) -> tomlkit.items.Table:
+    """Get-or-create a top-level table."""
+    if key not in doc:
+        doc[key] = tomlkit.table()
+    return doc[key]
+
+
+def do_advanced() -> None:
+    """Wizard for speech / stream_preview / rate_limit / quiet settings."""
+    header("高级设置")
+
+    doc = load_config()
+
+    # Current state summary
+    speech = doc.get("speech", {})
+    stream = doc.get("stream_preview", {})
+    rate = doc.get("rate_limit", {})
+    quiet = doc.get("quiet", None)
+
+    print()
+    print(f"  {BOLD}当前设置:{RESET}")
+    print(f"  语音转文字:      {'启用' if speech.get('enabled') else '未启用'}")
+    print(f"  流式预览:        {'关闭' if stream.get('enabled') is False else '启用（默认）'}")
+    rate_max = rate.get("max_messages", 20)
+    rate_win = rate.get("window_secs", 60)
+    print(f"  速率限制:        {rate_max} 条 / {rate_win} 秒" if rate_max else "  速率限制:        已禁用")
+    print(f"  默认静默模式:     {'启用' if quiet else '未启用'}")
+    print()
+
+    print(f"  {BOLD}操作:{RESET}")
+    print(f"  1) 配置语音转文字 (speech)")
+    print(f"  2) 配置流式预览 (stream_preview)")
+    print(f"  3) 配置速率限制 (rate_limit)")
+    print(f"  4) 切换默认静默模式 (quiet)")
+    print(f"  5) 查看完整官方配置参考")
+    print(f"  6) 返回")
+
+    choice = ask("选择")
+
+    if choice == "1":
+        _configure_speech(doc, speech)
+    elif choice == "2":
+        _configure_stream_preview(doc, stream)
+    elif choice == "3":
+        _configure_rate_limit(doc, rate)
+    elif choice == "4":
+        new_quiet = not bool(quiet)
+        doc["quiet"] = new_quiet
+        save_config(doc)
+        info(f"默认静默模式已{'启用' if new_quiet else '关闭'}")
+        prompt_restart()
+    elif choice == "5":
+        try:
+            result = subprocess.run(
+                ["cc-connect", "config-example"],
+                capture_output=True, text=True,
+            )
+            if result.returncode == 0:
+                print()
+                # Use pager if available
+                pager = os.environ.get("PAGER", "less")
+                if shutil.which(pager):
+                    p = subprocess.Popen([pager], stdin=subprocess.PIPE)
+                    p.communicate(result.stdout.encode())
+                else:
+                    print(result.stdout)
+            else:
+                err("获取配置参考失败")
+        except FileNotFoundError:
+            err("cc-connect 未安装")
+    elif choice in ("6", ""):
+        return
+    else:
+        err("无效选择。")
+
+
+def _configure_speech(doc: tomlkit.TOMLDocument, current: dict) -> None:
+    print(f"\n  {CYAN}── 语音转文字 ──{RESET}")
+    print(f"  {DIM}启用后，飞书/Telegram 收到的语音会先转文字再发给 agent{RESET}")
+    print(f"  {DIM}需要 ffmpeg（macOS: brew install ffmpeg）{RESET}\n")
+
+    enabled = current.get("enabled", False)
+    if ask_confirm(f"启用语音转文字？", default_yes=not enabled):
+        print(f"\n  {BOLD}选择提供商:{RESET}")
+        print(f"  1) OpenAI Whisper")
+        print(f"  2) Groq (Whisper-large-v3-turbo，通常更快)")
+        print(f"  3) 通义千问 ASR")
+        prov_choice = ask("选择", "1")
+        provider_map = {"1": "openai", "2": "groq", "3": "qwen"}
+        provider = provider_map.get(prov_choice, "openai")
+
+        existing_section = current.get(provider, {})
+        api_key = ask_secret(f"{provider.upper()} API Key")
+        if not api_key:
+            err("API Key 不能为空。")
+            return
+
+        default_model = {
+            "openai": "whisper-1",
+            "groq": "whisper-large-v3-turbo",
+            "qwen": "qwen3-asr-flash",
+        }[provider]
+        model = ask("模型", existing_section.get("model", default_model))
+
+        base_url = ask("Base URL (回车用默认)", existing_section.get("base_url", ""))
+
+        speech_table = _ensure_table(doc, "speech")
+        speech_table["enabled"] = True
+        speech_table["provider"] = provider
+        lang = ask("识别语言 (zh/en/留空自动)", current.get("language", ""))
+        if lang:
+            speech_table["language"] = lang
+
+        prov_table = tomlkit.table()
+        prov_table["api_key"] = api_key
+        prov_table["model"] = model
+        if base_url:
+            prov_table["base_url"] = base_url
+        speech_table[provider] = prov_table
+
+        save_config(doc)
+        info("语音转文字已配置")
+        prompt_restart()
+    else:
+        if "speech" in doc:
+            doc["speech"]["enabled"] = False
+            save_config(doc)
+            info("已关闭语音转文字")
+            prompt_restart()
+
+
+def _configure_stream_preview(doc: tomlkit.TOMLDocument, current: dict) -> None:
+    print(f"\n  {CYAN}── 流式预览 ──{RESET}")
+    print(f"  {DIM}Agent 输出时实时更新消息（像\"正在输入\"效果）{RESET}")
+    print(f"  {DIM}支持飞书 / Telegram / Discord，默认启用{RESET}\n")
+
+    currently_enabled = current.get("enabled", True)
+    print(f"  当前: {'启用' if currently_enabled else '关闭'}")
+    new_state = ask_confirm("启用流式预览？", default_yes=currently_enabled)
+
+    sp_table = _ensure_table(doc, "stream_preview")
+    sp_table["enabled"] = new_state
+
+    if new_state:
+        interval = ask("更新间隔 (毫秒)", str(current.get("interval_ms", 1500)))
+        try:
+            sp_table["interval_ms"] = int(interval)
+        except ValueError:
+            warn("非数字，保留默认 1500")
+            sp_table["interval_ms"] = 1500
+
+    save_config(doc)
+    info("流式预览已更新")
+    prompt_restart()
+
+
+def _configure_rate_limit(doc: tomlkit.TOMLDocument, current: dict) -> None:
+    print(f"\n  {CYAN}── 速率限制 ──{RESET}")
+    print(f"  {DIM}每个会话的滑动窗口限流，防止刷消息{RESET}\n")
+
+    cur_max = current.get("max_messages", 20)
+    cur_win = current.get("window_secs", 60)
+    print(f"  当前: {cur_max} 条 / {cur_win} 秒（0 = 禁用）\n")
+
+    max_str = ask("每窗口最大消息数（0 禁用）", str(cur_max))
+    try:
+        max_msg = int(max_str)
+    except ValueError:
+        err("请输入数字。")
+        return
+
+    rl_table = _ensure_table(doc, "rate_limit")
+    rl_table["max_messages"] = max_msg
+
+    if max_msg > 0:
+        win_str = ask("窗口秒数", str(cur_win))
+        try:
+            rl_table["window_secs"] = int(win_str)
+        except ValueError:
+            warn("非数字，保留默认 60")
+            rl_table["window_secs"] = 60
+
+    save_config(doc)
+    info("速率限制已更新")
+    prompt_restart()
+
+
+def do_backup() -> None:
+    """Backup / restore config and related state."""
+    header("备份 / 恢复")
+
+    BACKUP_DIR.mkdir(parents=True, exist_ok=True)
+    existing = sorted(BACKUP_DIR.glob("cc-connect-backup-*.zip"), reverse=True)
+
+    print()
+    print(f"  {BOLD}操作:{RESET}")
+    print(f"  1) 创建备份（config.toml + crons + providers）")
+    print(f"  2) 创建备份（包含会话历史，文件较大）")
+    print(f"  3) 从备份恢复")
+    print(f"  4) 查看备份列表")
+    print(f"  5) 返回")
+    print()
+
+    choice = ask("选择")
+
+    if choice in ("1", "2"):
+        include_sessions = (choice == "2")
+        pairs = _backup_paths(include_sessions)
+        if not pairs:
+            err("没有可备份的内容。")
+            return
+
+        stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+        suffix = "-full" if include_sessions else ""
+        backup_path = BACKUP_DIR / f"cc-connect-backup-{stamp}{suffix}.zip"
+
+        try:
+            with zipfile.ZipFile(backup_path, "w", zipfile.ZIP_DEFLATED) as zf:
+                for src, arc in pairs:
+                    zf.write(src, arcname=arc)
+            size_kb = backup_path.stat().st_size / 1024
+            info(f"备份已创建: {backup_path}")
+            print(f"  {DIM}包含 {len(pairs)} 个文件，{size_kb:.1f} KB{RESET}")
+        except OSError as e:
+            err(f"备份失败: {e}")
+
+    elif choice == "3":
+        if not existing:
+            warn("没有可用备份。")
+            print(f"  {DIM}备份目录: {BACKUP_DIR}{RESET}")
+            return
+        print(f"\n  {BOLD}选择要恢复的备份:{RESET}")
+        for i, p in enumerate(existing[:20], 1):
+            size = p.stat().st_size / 1024
+            mtime = datetime.fromtimestamp(p.stat().st_mtime).strftime("%Y-%m-%d %H:%M")
+            print(f"  {i:>2}) {p.name}  {DIM}({size:.1f} KB, {mtime}){RESET}")
+
+        idx_str = ask("备份编号")
+        try:
+            idx = int(idx_str) - 1
+        except ValueError:
+            err("请输入数字。")
+            return
+        if idx < 0 or idx >= len(existing[:20]):
+            err("无效编号。")
+            return
+
+        backup = existing[idx]
+        print(f"\n  {YELLOW}警告{RESET}：恢复会覆盖当前的 config.toml 和 crons/jobs.json")
+        print(f"  恢复前系统会先自动创建一份快照\n")
+        if not ask_confirm(f"确认从 {backup.name} 恢复？", default_yes=False):
+            return
+
+        # Pre-restore snapshot
+        pre_stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+        pre_snapshot = BACKUP_DIR / f"cc-connect-backup-{pre_stamp}-pre-restore.zip"
+        try:
+            snap_pairs = _backup_paths(include_sessions=False)
+            if snap_pairs:
+                with zipfile.ZipFile(pre_snapshot, "w", zipfile.ZIP_DEFLATED) as zf:
+                    for src, arc in snap_pairs:
+                        zf.write(src, arcname=arc)
+                info(f"恢复前快照: {pre_snapshot.name}")
+        except OSError as e:
+            warn(f"快照失败（继续恢复）: {e}")
+
+        # Extract
+        try:
+            with zipfile.ZipFile(backup, "r") as zf:
+                zf.extractall(CC_DIR)
+            info(f"已从 {backup.name} 恢复")
+            prompt_restart()
+        except (OSError, zipfile.BadZipFile) as e:
+            err(f"恢复失败: {e}")
+
+    elif choice == "4":
+        if not existing:
+            print(f"  {DIM}暂无备份{RESET}")
+            print(f"  {DIM}目录: {BACKUP_DIR}{RESET}")
+        else:
+            print(f"\n  {BOLD}备份列表（{len(existing)} 个）{RESET}")
+            total_kb = 0
+            for p in existing[:20]:
+                size = p.stat().st_size / 1024
+                total_kb += size
+                mtime = datetime.fromtimestamp(p.stat().st_mtime).strftime("%Y-%m-%d %H:%M")
+                print(f"  {p.name}  {DIM}({size:.1f} KB, {mtime}){RESET}")
+            print(f"\n  {DIM}共 {total_kb:.1f} KB{RESET}")
+            print(f"  {DIM}目录: {BACKUP_DIR}{RESET}")
+        input(f"\n  {DIM}按回车返回...{RESET}")
+
+    elif choice in ("5", ""):
+        return
+    else:
+        err("无效选择。")
+
+
+def do_install() -> None:
+    """Entry point for [i] — install/update and health check."""
+    header("安装 / 更新 / 诊断")
+
+    print()
+    print(f"  1) 安装 / 更新 cc-connect")
+    print(f"  2) 体检（检查当前环境是否健康）")
+    print(f"  3) 返回")
+    print()
+
+    choice = ask("选择")
+    if choice == "1":
+        _do_install_or_update()
+    elif choice == "2":
+        _do_health_check()
+    elif choice in ("3", ""):
+        return
+    else:
+        err("无效选择。")
+
+
 def do_restart() -> None:
     """Restart cc-connect daemon."""
     header("重启服务")
@@ -1517,15 +2340,23 @@ def main() -> None:
     while True:
         header("cc-connect 配置管理")
         show_dashboard()
+        _first_run_hint()
 
         print(
-            f"  {BOLD}[a]{RESET} 添加   "
-            f"{BOLD}[e]{RESET} 编辑   "
-            f"{BOLD}[d]{RESET} 删除   "
-            f"{BOLD}[w]{RESET} 复用项目   "
-            f"{BOLD}[m]{RESET} 模型/服务商   "
-            f"{BOLD}[r]{RESET} 重启   "
-            f"{BOLD}[i]{RESET} 安装/更新   "
+            f"  {BOLD}[a]{RESET} 添加  "
+            f"{BOLD}[e]{RESET} 编辑  "
+            f"{BOLD}[d]{RESET} 删除  "
+            f"{BOLD}[w]{RESET} 复用  "
+            f"{BOLD}[m]{RESET} 模型/服务商  "
+            f"{BOLD}[c]{RESET} 定时任务  "
+            f"{BOLD}[l]{RESET} 日志"
+        )
+        print(
+            f"  {BOLD}[h]{RESET} 命令参考  "
+            f"{BOLD}[g]{RESET} 高级设置  "
+            f"{BOLD}[b]{RESET} 备份/恢复  "
+            f"{BOLD}[r]{RESET} 重启  "
+            f"{BOLD}[i]{RESET} 安装/诊断  "
             f"{BOLD}[q]{RESET} 退出"
         )
         print()
@@ -1547,6 +2378,16 @@ def main() -> None:
                 do_reuse()
             case "m":
                 do_model()
+            case "c":
+                do_cron()
+            case "l":
+                do_logs()
+            case "h":
+                do_help()
+            case "g":
+                do_advanced()
+            case "b":
+                do_backup()
             case "r":
                 do_restart()
             case "i":
