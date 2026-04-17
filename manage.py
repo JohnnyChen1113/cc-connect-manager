@@ -73,12 +73,63 @@ def ask(label: str, default: str = "") -> str:
 
 
 def ask_secret(label: str) -> str:
+    """Read a secret from stdin, echoing '*' per keystroke so the user can see
+    they're typing. Falls back to silent getpass when stdin is not a TTY or
+    termios isn't available."""
+    prompt = f"  {label}: "
+    if not sys.stdin.isatty():
+        try:
+            return getpass.getpass(prompt).strip()
+        except (EOFError, KeyboardInterrupt):
+            print()
+            return ""
+
     try:
-        answer = getpass.getpass(f"  {label}: ")
-    except (EOFError, KeyboardInterrupt):
-        print()
+        import termios
+        import tty
+    except ImportError:
+        try:
+            return getpass.getpass(prompt).strip()
+        except (EOFError, KeyboardInterrupt):
+            print()
+            return ""
+
+    sys.stdout.write(prompt)
+    sys.stdout.flush()
+
+    fd = sys.stdin.fileno()
+    old = termios.tcgetattr(fd)
+    chars: list[str] = []
+    cancelled = False
+    try:
+        tty.setraw(fd)
+        while True:
+            c = sys.stdin.read(1)
+            if c in ("\r", "\n"):
+                break
+            if c == "\x03":  # Ctrl+C
+                cancelled = True
+                break
+            if c == "\x04":  # Ctrl+D
+                break
+            if c in ("\x7f", "\x08"):  # Backspace / Delete
+                if chars:
+                    chars.pop()
+                    sys.stdout.write("\b \b")
+                    sys.stdout.flush()
+                continue
+            if c.isprintable():
+                chars.append(c)
+                sys.stdout.write("*")
+                sys.stdout.flush()
+    finally:
+        termios.tcsetattr(fd, termios.TCSADRAIN, old)
+        sys.stdout.write("\r\n")
+        sys.stdout.flush()
+
+    if cancelled:
         return ""
-    return answer.strip()
+    return "".join(chars).strip()
 
 
 def pause_return(prompt: str = "按回车返回...") -> None:
@@ -254,12 +305,14 @@ def _find_cc_pid() -> int | None:
 def restart_cc() -> bool:
     """Restart cc-connect daemon with cascading fallbacks.
 
-    Cascade: `daemon restart` → kill+wait for launchd KeepAlive →
-    explicit `daemon restart` (now that nothing is running) → `daemon start`.
+    Cascade is silent on success — user only sees 'restarting…' and the final
+    PID. If every attempt fails, surface the last error and manual recovery
+    hints. Cascade order: `daemon restart` → kill+wait for launchd KeepAlive
+    → explicit `daemon restart` → `daemon start`.
     """
     print(f"\n  {DIM}正在重启 cc-connect...{RESET}")
 
-    rc, _, _ = cc_cmd("daemon", "restart")
+    rc, _, stderr = cc_cmd("daemon", "restart")
     if rc == -1:
         err("cc-connect 未安装或不在 PATH 中")
         return False
@@ -270,7 +323,6 @@ def restart_cc() -> bool:
             info(f"cc-connect 已重启 (PID {pid})")
             return True
 
-    warn("daemon restart 失败，尝试 kill 进程...")
     pid = _find_cc_pid()
     if pid:
         try:
@@ -284,7 +336,6 @@ def restart_cc() -> bool:
         info(f"cc-connect 已重启 (PID {new_pid})")
         return True
 
-    print(f"  {DIM}launchd 未触发，显式启动...{RESET}")
     for sub in ("restart", "start"):
         rc, _, stderr = cc_cmd("daemon", sub)
         if rc == 0:
@@ -294,7 +345,7 @@ def restart_cc() -> bool:
                 info(f"cc-connect 已重启 (PID {new_pid})")
                 return True
 
-    err("多次尝试均失败，请手动排查")
+    err("重启失败，请手动处理")
     if stderr:
         print(f"  {DIM}最后错误: {stderr.strip()}{RESET}")
     print(f"  {DIM}手动启动: cc-connect daemon start{RESET}")
