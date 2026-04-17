@@ -329,13 +329,13 @@ OFFICIAL_MODEL_CHOICES = [
 # (display_label, preset_name, base_url, suggested_model)
 # suggested_model 仅作提示默认值，用户可覆盖为最新版本号
 PROVIDER_PRESETS = [
-    ("Claude 官方 API (自带 Key)", "anthropic",   "https://api.anthropic.com",                                       "claude-sonnet-4-6"),
-    ("智谱 GLM",                   "glm",         "https://open.bigmodel.cn/api/anthropic",                          "glm-4.6"),
-    ("月之暗面 Kimi",               "kimi",        "https://api.moonshot.cn/anthropic",                               "kimi-k2-0905-preview"),
-    ("DeepSeek",                  "deepseek",    "https://api.deepseek.com/anthropic",                              "deepseek-chat"),
-    ("通义千问 Qwen",               "qwen",        "https://dashscope.aliyuncs.com/api/v2/apps/claude-code-proxy/v1", "qwen3-coder-plus"),
-    ("硅基流动 SiliconFlow",         "siliconflow", "https://api.siliconflow.cn/anthropic",                            ""),
-    ("自定义",                     "custom",      "",                                                                ""),
+    ("Anthropic 官方",       "anthropic",   "https://api.anthropic.com",                                       "claude-sonnet-4-6"),
+    ("智谱 GLM",             "glm",         "https://open.bigmodel.cn/api/anthropic",                          "glm-4.6"),
+    ("月之暗面 Kimi",         "kimi",        "https://api.moonshot.cn/anthropic",                               "kimi-k2-0905-preview"),
+    ("DeepSeek",            "deepseek",    "https://api.deepseek.com/anthropic",                              "deepseek-chat"),
+    ("通义千问 Qwen",         "qwen",        "https://dashscope.aliyuncs.com/api/v2/apps/claude-code-proxy/v1", "qwen3-coder-plus"),
+    ("硅基流动 SiliconFlow",   "siliconflow", "https://api.siliconflow.cn/anthropic",                            ""),
+    ("自定义",               "custom",      "",                                                                ""),
 ]
 
 
@@ -1137,17 +1137,19 @@ def _show_current_model_state(proj: dict, providers: list[dict]) -> None:
     print(f"\n  {BOLD}当前状态{RESET}")
     if providers:
         p = providers[0]
-        print(f"  服务商:   {GREEN}{p['name']}{RESET} (第三方)")
+        print(f"  认证方式: {GREEN}独立 API Key{RESET}")
+        print(f"  供应商:   {p['name']}")
         print(f"  {DIM}详情: {p['raw']}{RESET}")
         if len(providers) > 1:
             extras = ", ".join(x["name"] for x in providers[1:])
             print(f"  {DIM}其他已注册: {extras}{RESET}")
     else:
-        print(f"  服务商:   Claude 官方")
+        print(f"  认证方式: {GREEN}订阅登录{RESET} (使用 daemon 默认 Claude Code 认证)")
+        print(f"  供应商:   Anthropic (Claude Code 内置)")
     if current_model:
         print(f"  模型:     {current_model}")
     else:
-        print(f"  模型:     {DIM}(未指定 — 使用 cc-connect 默认){RESET}")
+        print(f"  模型:     {DIM}(未指定 — 使用 daemon 默认){RESET}")
 
 
 def _clear_providers(proj_name: str, providers: list[dict]) -> bool:
@@ -1160,12 +1162,13 @@ def _clear_providers(proj_name: str, providers: list[dict]) -> bool:
 
 
 def _switch_official_model(doc: tomlkit.TOMLDocument, proj: dict, providers: list[dict]) -> None:
-    print(f"\n  {CYAN}── 选择 Claude 官方模型 ──{RESET}")
+    print(f"\n  {CYAN}── 选择模型（沿用 daemon 默认认证）──{RESET}")
+    print(f"  {DIM}用 daemon 当前的 Claude Code 登录态/订阅，只切换模型{RESET}")
     for i, (_, label) in enumerate(OFFICIAL_MODEL_CHOICES, 1):
         val = OFFICIAL_MODEL_CHOICES[i-1][0]
         print(f"  {i}) {label}  {DIM}[{val}]{RESET}")
     custom_idx = len(OFFICIAL_MODEL_CHOICES) + 1
-    print(f"  {custom_idx}) 自定义版本 ID (如 claude-sonnet-4-5)")
+    print(f"  {custom_idx}) 自定义版本 ID (如 claude-sonnet-4-6)")
 
     choice = ask("选择编号")
     try:
@@ -1209,7 +1212,8 @@ def _switch_official_model(doc: tomlkit.TOMLDocument, proj: dict, providers: lis
 
 
 def _switch_third_party(doc: tomlkit.TOMLDocument, proj: dict, providers: list[dict]) -> None:
-    print(f"\n  {CYAN}── 选择第三方 API 服务商 ──{RESET}")
+    print(f"\n  {CYAN}── 选择 API 供应商 ──{RESET}")
+    print(f"  {DIM}该项目将用独立 Key 调对应供应商，不再依赖 daemon 默认认证{RESET}")
     for i, (label, _, base, _) in enumerate(PROVIDER_PRESETS, 1):
         suffix = f"  {DIM}{base}{RESET}" if base else ""
         print(f"  {i}) {label}{suffix}")
@@ -1341,9 +1345,9 @@ def do_model() -> None:
     _show_current_model_state(proj, providers)
 
     print(f"\n  {CYAN}── 操作 ──{RESET}")
-    print(f"  1) 切换 Claude 官方模型 (sonnet/opus/haiku/自定义)")
-    print(f"  2) 切换到第三方 API (GLM/Kimi/DeepSeek/Qwen/硅基流动/自定义)")
-    print(f"  3) 恢复 Claude 官方默认 (清除 model 和 provider)")
+    print(f"  1) 用订阅登录 — 沿用 daemon 默认认证，只换模型 (sonnet/opus/haiku)")
+    print(f"  2) 用 API Key — 给该项目独立配 Key (Anthropic/GLM/Kimi/DeepSeek/...)")
+    print(f"  3) 恢复默认 — 清除自定义 model 和 provider")
     print(f"  4) 返回")
 
     choice = ask("选择")
