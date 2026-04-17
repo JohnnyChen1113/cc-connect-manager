@@ -1799,16 +1799,53 @@ def do_import_session() -> None:
         preview = (s["first_user_msg"] or "(空)")[:60].replace("\n", " ")
         print(f"  {i:<4}{s['uuid'][:8]:<11}{s['turn_count']:<6}{mtime_str:<20}{preview}")
 
-    idx = pick_index("选择要导入的桌面 session", len(recent))
+    idx = pick_index("输入上面的编号选择桌面 session", len(recent))
     if idx is None:
         return
     desktop = recent[idx]
 
     cc_files = sorted(SESSIONS_DIR.glob(f"{proj_name}_*.json"))
     if not cc_files:
-        err(f"项目 '{proj_name}' 还没有任何飞书 session 文件")
-        print(f"  {DIM}请先在飞书里给机器人发一条消息激活，然后回来再试{RESET}")
-        return
+        # First-time bootstrap: user hasn't messaged the bot yet. The session
+        # filename hash is derived from platform chat_id + user_id, which
+        # cc-connect only learns on the first inbound message. Guide the user
+        # through "send a message, then come back".
+        print()
+        print(f"  {YELLOW}项目 '{proj_name}' 还没有任何飞书聊天记录{RESET}")
+        print()
+        print(f"  绑定桌面 session 到飞书，需要 cc-connect 先知道你从哪个聊天窗口和它说话：")
+        print(f"  (聊天窗口 = 你的飞书账号 + 具体对话框)")
+        print()
+
+        running, _ = is_cc_running()
+        if not running:
+            warn("当前 cc-connect daemon 没在跑，飞书发消息不会有响应")
+            if ask_confirm("先启动 daemon？"):
+                if not restart_cc():
+                    err("启动失败，请手动处理后再试")
+                    return
+            else:
+                print("  已取消。")
+                return
+
+        print(f"  {BOLD}请按顺序操作：{RESET}")
+        print(f"  1) 在飞书里找到「{proj_name}」这个机器人")
+        print(f"  2) 给它随便发一句话（比如 'hi'，它可能会回复也可能报错，都没关系）")
+        print(f"  3) 发送成功后回来按回车，我会自动检测")
+        print()
+
+        while not cc_files:
+            try:
+                input(f"  {DIM}按回车检查... (Ctrl+C 取消){RESET}")
+            except (EOFError, KeyboardInterrupt):
+                print()
+                print("  已取消。")
+                return
+            cc_files = sorted(SESSIONS_DIR.glob(f"{proj_name}_*.json"))
+            if not cc_files:
+                print(f"  {DIM}还没检测到聊天记录，确认消息已成功发出？{RESET}")
+
+        info(f"检测到 {len(cc_files)} 个聊天，继续...")
 
     if len(cc_files) == 1:
         cc_file = cc_files[0]
@@ -1820,7 +1857,7 @@ def do_import_session() -> None:
         for i, f in enumerate(cc_files, 1):
             preview = _cc_session_preview(f)[:60].replace("\n", " ") or "(空)"
             print(f"  {i:<4}{f.name:<36}{preview}")
-        chat_idx = pick_index("选择要导入到的飞书聊天", len(cc_files))
+        chat_idx = pick_index("输入编号选择要导入到的飞书聊天", len(cc_files))
         if chat_idx is None:
             return
         cc_file = cc_files[chat_idx]
@@ -1843,7 +1880,7 @@ def do_import_session() -> None:
     next_slot = f"s{next_slot_num}"
     print(f"  {len(slot_keys) + 1}) 新建 {next_slot}")
 
-    slot_idx = pick_index("选择槽位", len(slot_keys) + 1)
+    slot_idx = pick_index("输入编号选择槽位", len(slot_keys) + 1)
     if slot_idx is None:
         return
     is_new = slot_idx == len(slot_keys)
