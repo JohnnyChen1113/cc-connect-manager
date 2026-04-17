@@ -270,6 +270,27 @@ PLATFORM_CHOICES = [
 PLATFORMS = {key: label for key, label, _, _ in PLATFORM_CHOICES}
 
 
+# ── Provider / Model presets ──────────────────────────────────────────
+
+# (value, label) — value is what goes into agent.options.model
+OFFICIAL_MODEL_CHOICES = [
+    ("sonnet", "Sonnet (最新)"),
+    ("opus",   "Opus (最新)"),
+    ("haiku",  "Haiku (最新)"),
+]
+
+# (display_label, preset_name, base_url, suggested_model)
+# suggested_model 仅作提示默认值，用户可覆盖为最新版本号
+PROVIDER_PRESETS = [
+    ("智谱 GLM",            "glm",         "https://open.bigmodel.cn/api/anthropic",                          "glm-4.6"),
+    ("月之暗面 Kimi",        "kimi",        "https://api.moonshot.cn/anthropic",                               "kimi-k2-0905-preview"),
+    ("DeepSeek",            "deepseek",    "https://api.deepseek.com/anthropic",                              "deepseek-chat"),
+    ("通义千问 Qwen",        "qwen",        "https://dashscope.aliyuncs.com/api/v2/apps/claude-code-proxy/v1", "qwen3-coder-plus"),
+    ("硅基流动 SiliconFlow",  "siliconflow", "https://api.siliconflow.cn/anthropic",                            ""),
+    ("自定义",               "custom",      "",                                                                ""),
+]
+
+
 def choose_platform() -> tuple[str, str | None] | None:
     """Let user pick a platform. Returns (config_type, domain_override) or None."""
     print(f"\n  {CYAN}── 选择平台 ──{RESET}")
@@ -649,6 +670,109 @@ def show_feishu_guide(app_id: str, is_lark: bool = False) -> None:
     print(f"     {search_hint}\n")
 
 
+# ── cc-connect provider helpers ───────────────────────────────────────
+
+
+def get_all_providers() -> dict[str, list[dict]]:
+    """Parse `cc-connect provider list` output into {project: [{name, raw}, ...]}.
+
+    Returns an empty dict if cc-connect is unavailable or errors.
+    """
+    try:
+        result = subprocess.run(
+            ["cc-connect", "provider", "list"],
+            capture_output=True, text=True, timeout=5,
+        )
+    except (FileNotFoundError, subprocess.TimeoutExpired):
+        return {}
+    if result.returncode != 0:
+        return {}
+
+    out: dict[str, list[dict]] = {}
+    current: str | None = None
+    for line in result.stdout.splitlines():
+        stripped = line.strip()
+        if stripped.startswith("── ") and stripped.endswith(" ──"):
+            current = stripped[3:-3].strip()
+            out[current] = []
+            continue
+        if current is None or not stripped:
+            continue
+        if "no providers" in stripped.lower():
+            continue
+        # First token is the provider name (may have details after)
+        token = stripped.split(maxsplit=1)[0]
+        out[current].append({"name": token, "raw": stripped})
+    return out
+
+
+def list_providers(project: str) -> list[dict]:
+    return get_all_providers().get(project, [])
+
+
+def add_provider_cc(
+    project: str,
+    name: str,
+    api_key: str,
+    base_url: str = "",
+    model: str = "",
+) -> bool:
+    """Call `cc-connect provider add`. Returns True on success."""
+    cmd = [
+        "cc-connect", "provider", "add",
+        "-project", project,
+        "-name", name,
+        "-api-key", api_key,
+    ]
+    if base_url:
+        cmd += ["-base-url", base_url]
+    if model:
+        cmd += ["-model", model]
+    try:
+        result = subprocess.run(cmd, capture_output=True, text=True)
+    except FileNotFoundError:
+        err("cc-connect 未安装或不在 PATH 中")
+        return False
+    if result.returncode != 0:
+        msg = result.stderr.strip() or result.stdout.strip() or "未知错误"
+        err(f"添加 provider 失败: {msg}")
+        return False
+    return True
+
+
+def remove_provider_cc(project: str, name: str) -> bool:
+    """Call `cc-connect provider remove`. Returns True on success."""
+    try:
+        result = subprocess.run(
+            ["cc-connect", "provider", "remove",
+             "-project", project, "-name", name],
+            capture_output=True, text=True,
+        )
+    except FileNotFoundError:
+        err("cc-connect 未安装或不在 PATH 中")
+        return False
+    if result.returncode != 0:
+        msg = result.stderr.strip() or result.stdout.strip() or "未知错误"
+        err(f"删除 provider '{name}' 失败: {msg}")
+        return False
+    return True
+
+
+def format_model_display(project: dict, providers_cache: dict[str, list[dict]]) -> str:
+    """Return short string for the dashboard 模型 column.
+
+    Priority: provider (runtime override) > agent.options.model > fallback.
+    """
+    name = project.get("name", "")
+    provs = providers_cache.get(name, [])
+    if provs:
+        return provs[0]["name"]
+    model = project.get("agent", {}).get("options", {}).get("model", "")
+    if model:
+        return model
+    return "—"
+
+
 # ── Dashboard ─────────────────────────────────────────────────────────
 
 
@@ -664,12 +788,14 @@ def show_dashboard() -> None:
         print(f"  {DIM}暂无项目{RESET}\n")
         return
 
+    providers_cache = get_all_providers()
+
     print()
     print(
         f"  {BOLD}{'#':<4}{'名称':<21}{'平台':<9}"
-        f"{'工作目录':<40}{'Session ID'}{RESET}"
+        f"{'工作目录':<36}{'模型/服务商':<22}{'Session ID'}{RESET}"
     )
-    print(f"  {DIM}{'─' * 110}{RESET}")
+    print(f"  {DIM}{'─' * 130}{RESET}")
     for i, proj in enumerate(projects, 1):
         name = proj.get("name", "?")
         plats = proj.get("platforms", [])
@@ -684,10 +810,15 @@ def show_dashboard() -> None:
         else:
             plat_display = "-"
         work_dir = proj.get("agent", {}).get("options", {}).get("work_dir", "-")
+        if len(work_dir) > 34:
+            work_dir = "…" + work_dir[-33:]
+        model_display = format_model_display(proj, providers_cache)
+        if len(model_display) > 20:
+            model_display = model_display[:19] + "…"
         session_id = get_session_id(name) or "—"
         print(
             f"  {i:<4}{name:<21}{plat_display:<9}"
-            f"{work_dir:<40}{session_id}"
+            f"{work_dir:<36}{model_display:<22}{session_id}"
         )
     print()
 
@@ -949,6 +1080,233 @@ def do_reuse() -> None:
     prompt_restart()
 
 
+# ── Model / Provider switching ────────────────────────────────────────
+
+
+def _show_current_model_state(proj: dict, providers: list[dict]) -> None:
+    """Print the current model/provider state for a project."""
+    current_model = proj.get("agent", {}).get("options", {}).get("model", "")
+    print(f"\n  {BOLD}当前状态{RESET}")
+    if providers:
+        p = providers[0]
+        print(f"  服务商:   {GREEN}{p['name']}{RESET} (第三方)")
+        print(f"  {DIM}详情: {p['raw']}{RESET}")
+        if len(providers) > 1:
+            extras = ", ".join(x["name"] for x in providers[1:])
+            print(f"  {DIM}其他已注册: {extras}{RESET}")
+    else:
+        print(f"  服务商:   Claude 官方")
+    if current_model:
+        print(f"  模型:     {current_model}")
+    else:
+        print(f"  模型:     {DIM}(未指定 — 使用 cc-connect 默认){RESET}")
+
+
+def _clear_providers(proj_name: str, providers: list[dict]) -> bool:
+    """Remove all providers for a project. Returns True if all succeeded."""
+    ok = True
+    for p in providers:
+        if not remove_provider_cc(proj_name, p["name"]):
+            ok = False
+    return ok
+
+
+def _switch_official_model(doc: tomlkit.TOMLDocument, proj: dict, providers: list[dict]) -> None:
+    print(f"\n  {CYAN}── 选择 Claude 官方模型 ──{RESET}")
+    for i, (_, label) in enumerate(OFFICIAL_MODEL_CHOICES, 1):
+        val = OFFICIAL_MODEL_CHOICES[i-1][0]
+        print(f"  {i}) {label}  {DIM}[{val}]{RESET}")
+    custom_idx = len(OFFICIAL_MODEL_CHOICES) + 1
+    print(f"  {custom_idx}) 自定义版本 ID (如 claude-sonnet-4-5)")
+
+    choice = ask("选择编号")
+    try:
+        idx = int(choice) - 1
+    except ValueError:
+        err("请输入数字。")
+        return
+
+    if 0 <= idx < len(OFFICIAL_MODEL_CHOICES):
+        model = OFFICIAL_MODEL_CHOICES[idx][0]
+    elif idx == len(OFFICIAL_MODEL_CHOICES):
+        model = ask("模型 ID")
+        if not model:
+            err("未输入模型 ID。")
+            return
+    else:
+        err("无效编号。")
+        return
+
+    # Confirm
+    proj_name = proj.get("name", "")
+    print()
+    if providers:
+        print(f"  {DIM}切换到官方模型会清除已注册的第三方 provider:{RESET}")
+        for p in providers:
+            print(f"    - {p['name']}")
+    if not ask_confirm(f"切换 '{proj_name}' 模型为 {model}？"):
+        print("  已取消。")
+        return
+
+    # Apply
+    if providers:
+        _clear_providers(proj_name, providers)
+
+    agent = proj.setdefault("agent", tomlkit.table())
+    agent_opts = agent.setdefault("options", tomlkit.table())
+    agent_opts["model"] = model
+    save_config(doc)
+    info(f"已切换 '{proj_name}' 到 Claude 官方模型: {model}")
+    prompt_restart()
+
+
+def _switch_third_party(doc: tomlkit.TOMLDocument, proj: dict, providers: list[dict]) -> None:
+    print(f"\n  {CYAN}── 选择第三方 API 服务商 ──{RESET}")
+    for i, (label, _, base, _) in enumerate(PROVIDER_PRESETS, 1):
+        suffix = f"  {DIM}{base}{RESET}" if base else ""
+        print(f"  {i}) {label}{suffix}")
+
+    choice = ask("选择编号")
+    try:
+        idx = int(choice) - 1
+    except ValueError:
+        err("请输入数字。")
+        return
+    if idx < 0 or idx >= len(PROVIDER_PRESETS):
+        err("无效编号。")
+        return
+
+    label, preset_name, base_url, suggest_model = PROVIDER_PRESETS[idx]
+
+    # Custom path — collect everything
+    if preset_name == "custom":
+        print(f"\n  {DIM}填写兼容 Claude API 协议的任意第三方接入点{RESET}")
+        name = ask("Provider 名称 (用于标识)", "custom")
+        base_url = ask("Base URL (必填)")
+        if not base_url:
+            err("Base URL 不能为空。")
+            return
+    else:
+        print(f"\n  {CYAN}── {label} ──{RESET}")
+        name = ask("Provider 名称 (cc-connect 内部标识)", preset_name)
+
+    api_key = ask_secret(f"{label} API Key")
+    if not api_key:
+        err("API Key 不能为空。")
+        return
+
+    if suggest_model:
+        print(f"  {DIM}建议默认: {suggest_model}{RESET}")
+        print(f"  {DIM}如有更新版本（如 glm-5.1），直接输入新版本号即可{RESET}")
+    model = ask("Model", suggest_model) if suggest_model else ask("Model")
+    if not model:
+        err("Model 不能为空。")
+        return
+
+    # Confirm
+    proj_name = proj.get("name", "")
+    print()
+    print(f"  {BOLD}变更预览:{RESET}")
+    print(f"    项目:     {proj_name}")
+    print(f"    服务商:   {label} ({name})")
+    print(f"    Base URL: {base_url}")
+    print(f"    Model:    {model}")
+    if providers:
+        print(f"    {DIM}将替换已有 provider: {', '.join(p['name'] for p in providers)}{RESET}")
+    agent_opts = proj.get("agent", {}).get("options", {})
+    if agent_opts.get("model"):
+        print(f"    {DIM}将清除 agent.options.model = '{agent_opts['model']}'{RESET}")
+    print()
+    if not ask_confirm("确认切换？"):
+        print("  已取消。")
+        return
+
+    # Apply: drop old providers first
+    if providers:
+        _clear_providers(proj_name, providers)
+
+    # Clear agent.options.model (provider takes precedence at runtime anyway)
+    if "model" in agent_opts:
+        del proj["agent"]["options"]["model"]
+        save_config(doc)
+
+    if add_provider_cc(proj_name, name, api_key, base_url=base_url, model=model):
+        info(f"已切换 '{proj_name}' 到 {label} / {model}")
+        prompt_restart()
+
+
+def _reset_to_default(doc: tomlkit.TOMLDocument, proj: dict, providers: list[dict]) -> None:
+    proj_name = proj.get("name", "")
+    agent_opts = proj.get("agent", {}).get("options", {})
+    current_model = agent_opts.get("model", "")
+
+    if not current_model and not providers:
+        info("当前已是 Claude 官方默认 (无自定义 model 或 provider)")
+        return
+
+    print()
+    print(f"  {BOLD}将清除:{RESET}")
+    if current_model:
+        print(f"    - agent.options.model = '{current_model}'")
+    for p in providers:
+        print(f"    - provider '{p['name']}'")
+    print()
+    if not ask_confirm("确认恢复 Claude 官方默认？", default_yes=False):
+        print("  已取消。")
+        return
+
+    changed = False
+    if current_model:
+        del proj["agent"]["options"]["model"]
+        save_config(doc)
+        changed = True
+    if providers:
+        _clear_providers(proj_name, providers)
+        changed = True
+
+    if changed:
+        info(f"'{proj_name}' 已恢复官方默认")
+        prompt_restart()
+
+
+def do_model() -> None:
+    """Switch model or API provider for a project."""
+    header("模型 / 服务商")
+
+    doc = load_config()
+    projects = get_projects(doc)
+    show_dashboard()
+
+    idx = pick_project(projects, "切换模型/服务商")
+    if idx is None:
+        return
+
+    proj = projects[idx]
+    proj_name = proj.get("name", "")
+    providers = list_providers(proj_name)
+
+    _show_current_model_state(proj, providers)
+
+    print(f"\n  {CYAN}── 操作 ──{RESET}")
+    print(f"  1) 切换 Claude 官方模型 (sonnet/opus/haiku/自定义)")
+    print(f"  2) 切换到第三方 API (GLM/Kimi/DeepSeek/Qwen/硅基流动/自定义)")
+    print(f"  3) 恢复 Claude 官方默认 (清除 model 和 provider)")
+    print(f"  4) 返回")
+
+    choice = ask("选择")
+    match choice:
+        case "1":
+            _switch_official_model(doc, proj, providers)
+        case "2":
+            _switch_third_party(doc, proj, providers)
+        case "3":
+            _reset_to_default(doc, proj, providers)
+        case "4" | "":
+            return
+        case _:
+            err("无效选择。")
+
+
 # ── Install wizard ────────────────────────────────────────────────────
 
 
@@ -1165,6 +1523,7 @@ def main() -> None:
             f"{BOLD}[e]{RESET} 编辑   "
             f"{BOLD}[d]{RESET} 删除   "
             f"{BOLD}[w]{RESET} 复用项目   "
+            f"{BOLD}[m]{RESET} 模型/服务商   "
             f"{BOLD}[r]{RESET} 重启   "
             f"{BOLD}[i]{RESET} 安装/更新   "
             f"{BOLD}[q]{RESET} 退出"
@@ -1186,6 +1545,8 @@ def main() -> None:
                 do_delete()
             case "w":
                 do_reuse()
+            case "m":
+                do_model()
             case "r":
                 do_restart()
             case "i":
