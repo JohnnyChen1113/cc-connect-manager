@@ -872,15 +872,22 @@ def show_dashboard() -> None:
 
 
 def pick_project(projects: list, action: str) -> int | None:
-    """Let user pick a project by number. Returns index or None."""
+    """Let user pick a project by number.
+
+    Returns the index, or None if the user backs out (empty / 0 / q / b).
+    Backing out is silent — no error message — so users can enter a menu
+    just to look around without being forced to commit.
+    """
     if not projects:
         warn("暂无项目。")
         return None
-    choice = ask(f"选择要{action}的项目编号")
+    choice = ask(f"选择要{action}的项目编号 {DIM}(回车 / 0 / q 返回){RESET}")
+    if choice == "" or choice.lower() in ("q", "b", "0", "back", "quit"):
+        return None
     try:
         idx = int(choice) - 1
     except ValueError:
-        err("请输入数字。")
+        err("请输入数字（或回车返回）。")
         return None
     if idx < 0 or idx >= len(projects):
         err("无效编号。")
