@@ -329,12 +329,13 @@ OFFICIAL_MODEL_CHOICES = [
 # (display_label, preset_name, base_url, suggested_model)
 # suggested_model 仅作提示默认值，用户可覆盖为最新版本号
 PROVIDER_PRESETS = [
-    ("智谱 GLM",            "glm",         "https://open.bigmodel.cn/api/anthropic",                          "glm-4.6"),
-    ("月之暗面 Kimi",        "kimi",        "https://api.moonshot.cn/anthropic",                               "kimi-k2-0905-preview"),
-    ("DeepSeek",            "deepseek",    "https://api.deepseek.com/anthropic",                              "deepseek-chat"),
-    ("通义千问 Qwen",        "qwen",        "https://dashscope.aliyuncs.com/api/v2/apps/claude-code-proxy/v1", "qwen3-coder-plus"),
-    ("硅基流动 SiliconFlow",  "siliconflow", "https://api.siliconflow.cn/anthropic",                            ""),
-    ("自定义",               "custom",      "",                                                                ""),
+    ("Claude 官方 API (自带 Key)", "anthropic",   "https://api.anthropic.com",                                       "claude-sonnet-4-6"),
+    ("智谱 GLM",                   "glm",         "https://open.bigmodel.cn/api/anthropic",                          "glm-4.6"),
+    ("月之暗面 Kimi",               "kimi",        "https://api.moonshot.cn/anthropic",                               "kimi-k2-0905-preview"),
+    ("DeepSeek",                  "deepseek",    "https://api.deepseek.com/anthropic",                              "deepseek-chat"),
+    ("通义千问 Qwen",               "qwen",        "https://dashscope.aliyuncs.com/api/v2/apps/claude-code-proxy/v1", "qwen3-coder-plus"),
+    ("硅基流动 SiliconFlow",         "siliconflow", "https://api.siliconflow.cn/anthropic",                            ""),
+    ("自定义",                     "custom",      "",                                                                ""),
 ]
 
 
@@ -1235,6 +1236,11 @@ def _switch_third_party(doc: tomlkit.TOMLDocument, proj: dict, providers: list[d
             return
     else:
         print(f"\n  {CYAN}── {label} ──{RESET}")
+        if preset_name == "anthropic":
+            print(f"  {DIM}说明: 给这个项目单独挂一把 Anthropic 官方 API Key{RESET}")
+            print(f"  {DIM}  - 本机 Claude Code 的登录态 / 订阅额度 与 daemon 独立{RESET}")
+            print(f"  {DIM}  - 配完之后，飞书里找这个项目对话就会走你给的 Key{RESET}")
+            print(f"  {DIM}  - 其他没配 provider 的项目仍然用 daemon 默认认证{RESET}")
         name = ask("Provider 名称 (cc-connect 内部标识)", preset_name)
 
     api_key = ask_secret(f"{label} API Key")
