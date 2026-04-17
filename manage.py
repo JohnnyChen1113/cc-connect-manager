@@ -107,12 +107,12 @@ def ask_secret(label: str) -> str:
             c = sys.stdin.read(1)
             if c in ("\r", "\n"):
                 break
-            if c == "\x03":  # Ctrl+C
+            if c == "\x03":
                 cancelled = True
                 break
-            if c == "\x04":  # Ctrl+D
+            if c == "\x04":
                 break
-            if c in ("\x7f", "\x08"):  # Backspace / Delete
+            if c in ("\x7f", "\x08"):
                 if chars:
                     chars.pop()
                     sys.stdout.write("\b \b")
@@ -214,10 +214,17 @@ def get_projects(doc: tomlkit.TOMLDocument) -> list:
 # ── Session info ──────────────────────────────────────────────────────
 
 
-def _extract_agent_id(session_file: Path) -> str | None:
+def _load_cc_session(path: Path) -> dict | None:
+    """Read a cc-connect sessions/*.json file. Returns None on any I/O or parse error."""
     try:
-        data = json.loads(session_file.read_text())
+        return json.loads(path.read_text())
     except (json.JSONDecodeError, OSError):
+        return None
+
+
+def _extract_agent_id(session_file: Path) -> str | None:
+    data = _load_cc_session(session_file)
+    if not data:
         return None
     sessions = data.get("sessions", {})
     for sid in sorted(sessions.keys(), reverse=True):
@@ -1688,9 +1695,9 @@ def _extract_user_text(content) -> str:
     if isinstance(content, list):
         for item in content:
             if isinstance(item, dict) and item.get("type") == "text":
-                text = item.get("text", "")
-                if text.strip():
-                    return text.strip()
+                text = item.get("text", "").strip()
+                if text:
+                    return text
     return ""
 
 
@@ -1706,16 +1713,21 @@ def _parse_desktop_session(jsonl: Path) -> dict | None:
     try:
         with jsonl.open() as f:
             for line in f:
+                # Claude Code jsonl has ~10 line types; only 'user' concerns us.
+                # Substring short-circuit saves 10-50× on long sessions.
+                if '"type":"user"' not in line:
+                    continue
                 try:
                     entry = json.loads(line)
                 except json.JSONDecodeError:
                     continue
-                if entry.get("type") == "user":
-                    turn_count += 1
-                    if not first_user_msg:
-                        first_user_msg = _extract_user_text(
-                            entry.get("message", {}).get("content", "")
-                        )
+                if entry.get("type") != "user":
+                    continue
+                turn_count += 1
+                if not first_user_msg:
+                    first_user_msg = _extract_user_text(
+                        entry.get("message", {}).get("content", "")
+                    )
     except OSError:
         return None
 
@@ -1727,36 +1739,49 @@ def _parse_desktop_session(jsonl: Path) -> dict | None:
     }
 
 
-def _scan_desktop_sessions(work_dir: str) -> list[dict]:
-    """Find Claude Code sessions whose project dir matches work_dir."""
+def _scan_desktop_sessions(work_dir: str, limit: int = 20) -> list[dict]:
+    """Find up to `limit` most-recently-modified Claude Code sessions for work_dir.
+
+    Sorts by mtime before parsing so we only pay jsonl parse cost for the
+    files we'll actually show."""
     proj_dir = CLAUDE_PROJECTS_DIR / _encode_work_dir(work_dir)
     if not proj_dir.is_dir():
         return []
-    sessions = [
-        meta for jsonl in proj_dir.glob("*.jsonl")
-        if (meta := _parse_desktop_session(jsonl))
-    ]
-    sessions.sort(key=lambda s: s["mtime"], reverse=True)
+
+    candidates = []
+    for jsonl in proj_dir.glob("*.jsonl"):
+        try:
+            candidates.append((jsonl.stat().st_mtime, jsonl))
+        except OSError:
+            continue
+    candidates.sort(reverse=True)
+
+    sessions = []
+    for _, jsonl in candidates[:limit]:
+        meta = _parse_desktop_session(jsonl)
+        if meta:
+            sessions.append(meta)
     return sessions
 
 
 def _cc_session_preview(path: Path) -> str:
     """Pull the most recent message text from a cc-connect session file."""
-    try:
-        data = json.loads(path.read_text())
-    except (json.JSONDecodeError, OSError):
+    data = _load_cc_session(path)
+    if not data:
         return ""
     latest_ts = ""
     latest_content = ""
     for sess in data.get("sessions", {}).values():
-        for msg in reversed(sess.get("history", [])):
-            ts = msg.get("timestamp", "")
-            if ts > latest_ts:
-                latest_ts = ts
-                content = msg.get("content", "")
-                if isinstance(content, str):
-                    latest_content = content
-                break
+        history = sess.get("history", [])
+        if not history:
+            continue
+        msg = history[-1]
+        ts = msg.get("timestamp", "")
+        if ts > latest_ts:
+            latest_ts = ts
+            content = msg.get("content", "")
+            if isinstance(content, str):
+                latest_content = content
     return latest_content
 
 
@@ -1862,10 +1887,9 @@ def do_import_session() -> None:
             return
         cc_file = cc_files[chat_idx]
 
-    try:
-        cc_data = json.loads(cc_file.read_text())
-    except (json.JSONDecodeError, OSError) as e:
-        err(f"读取 {cc_file.name} 失败: {e}")
+    cc_data = _load_cc_session(cc_file)
+    if cc_data is None:
+        err(f"读取 {cc_file.name} 失败")
         return
     slots = cc_data.setdefault("sessions", {})
     slot_keys = sorted(slots.keys())
@@ -1876,8 +1900,8 @@ def do_import_session() -> None:
         current_uuid = (s.get("agent_session_id") or "")[:8] or "(空)"
         name = s.get("name", "")
         print(f"  {i}) 覆盖 {sid} ({name}) — 当前 UUID: {current_uuid}")
-    next_slot_num = (max((int(k[1:]) for k in slot_keys if k.startswith("s") and k[1:].isdigit()), default=0) + 1)
-    next_slot = f"s{next_slot_num}"
+    used_nums = [int(k[1:]) for k in slot_keys if k.startswith("s") and k[1:].isdigit()]
+    next_slot = f"s{max(used_nums, default=0) + 1}"
     print(f"  {len(slot_keys) + 1}) 新建 {next_slot}")
 
     slot_idx = pick_index("输入编号选择槽位", len(slot_keys) + 1)
@@ -1885,6 +1909,9 @@ def do_import_session() -> None:
         return
     is_new = slot_idx == len(slot_keys)
     target_slot = next_slot if is_new else slot_keys[slot_idx]
+    if is_new and target_slot in slots:
+        err(f"槽位名冲突: {target_slot} 已存在，终止导入")
+        return
 
     print(f"\n  {BOLD}变更预览：{RESET}")
     print(f"    项目:        {proj_name}")
@@ -1936,18 +1963,11 @@ def do_import_session() -> None:
     except OSError as e:
         err(f"写入失败: {e}")
         if was_running:
-            cc_cmd("daemon", "start")
+            restart_cc()
         return
 
     if was_running:
-        print(f"  {DIM}启动 daemon...{RESET}")
-        cc_cmd("daemon", "start")
-        time.sleep(1)
-        running, pid = is_cc_running()
-        if running:
-            info(f"daemon 已启动 (PID {pid})")
-        else:
-            warn("daemon 未启动，用 [r] 重启一次")
+        restart_cc()
 
     print()
     info("导入完成 ✨")
